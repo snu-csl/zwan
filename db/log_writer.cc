@@ -11,6 +11,7 @@
 
 #include <stdint.h>
 #include "file/writable_file_writer.h"
+#include "monitoring/waf_stats.h"
 #include "rocksdb/env.h"
 #include "util/coding.h"
 #include "util/crc32c.h"
@@ -18,8 +19,13 @@
 #include "spdk/nvme.h"
 #include "spdk/nvme_zns.h"
 
+#include "plugin/zenfs/fs/wal_zrwa.h"
+
 namespace ROCKSDB_NAMESPACE {
 namespace log {
+
+unsigned int kBlockSize = 32768;
+void SetBlockSize(unsigned int size) { kBlockSize = size; }
 
 Writer::Writer(std::unique_ptr<WritableFileWriter>&& dest, uint64_t log_number,
                bool recycle_log_files, bool manual_flush)
@@ -52,6 +58,17 @@ IOStatus Writer::Close() {
 }
 
 IOStatus Writer::AppendRecord(const Slice& slice) {
+  // ZRWA WAL path: pack records into ZRWA pages
+  if (g_wal_zrwa != nullptr) {
+    ZrwaAppendResult result;
+    IOStatus s = g_wal_zrwa->appendRecord(slice.data() + 4, slice.size() - 4,
+                                          &result);
+    if (s.ok()) {
+      dest_->writable_file()->OnWalZrwaAppend(&result);
+    }
+    return s;
+  }
+
   const char* ptr = slice.data();
   size_t left = slice.size();
 
@@ -116,6 +133,9 @@ IOStatus Writer::AppendRecord(const Slice& slice) {
     EncodeFixed32(buffer, crc);
 
     memcpy(buffer + 7, ptr, fragment_length);
+
+    // on-disk WAL payload, excluding the zero-padded page tail
+    AddWalPayloadBytes(header_size + fragment_length);
 
     ptr += fragment_length;
     left -= fragment_length;
@@ -241,6 +261,10 @@ IOStatus Writer::EmitPhysicalRecord(RecordType t, const char* ptr, size_t n) {
     s = dest_->Append(Slice(ptr, n), payload_crc);
   }
   block_offset_ += header_size + n;
+  // on-disk WAL payload, excluding the block trailer padding
+  if (s.ok()) {
+    AddWalPayloadBytes(header_size + n);
+  }
   return s;
 }
 

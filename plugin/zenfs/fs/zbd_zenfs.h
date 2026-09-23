@@ -91,6 +91,7 @@ class ZoneSnapshot;
 class Zone {
   ZonedBlockDevice *zbd_;
   std::atomic_bool busy_;
+  std::atomic_bool wal_zrwa_opened_;
 
  public:
   explicit Zone(ZonedBlockDevice *zbd, struct spdk_nvme_zns_zone_desc *z);
@@ -107,13 +108,22 @@ class Zone {
   IOStatus Finish();
   IOStatus Close();
 
-  IOStatus Write(char *data, uint32_t size);
-  IOStatus Append(char *data, uint32_t size, uint64_t *alba);
+  IOStatus Write(char *data, uint32_t size, bool is_wal);
+  IOStatus Append(char *data, uint32_t size, uint64_t *alba, bool is_wal);
   bool IsUsed();
   bool IsFull();
   bool IsEmpty();
   uint64_t GetZoneNr();
   uint64_t GetCapacityLeft();
+  bool WasWalZrwaOpened() const {
+    return wal_zrwa_opened_.load(std::memory_order_relaxed);
+  }
+  void MarkWalZrwaOpened() {
+    wal_zrwa_opened_.store(true, std::memory_order_relaxed);
+  }
+  void ClearWalZrwaOpened() {
+    wal_zrwa_opened_.store(false, std::memory_order_relaxed);
+  }
   bool IsBusy() { return this->busy_.load(std::memory_order_relaxed); }
   bool Acquire() {
     bool expected = false;
@@ -132,6 +142,9 @@ class Zone {
 
   inline IOStatus CheckRelease();
 };
+
+// Open a zone in ZRWA mode, not safe from the WalZrwa IO thread.
+bool zrwa_open_zone(Zone* zone, ZonedBlockDevice* zbd);
 
 class ZonedBlockDevice {
  private:
@@ -165,9 +178,12 @@ class ZonedBlockDevice {
 
   uint32_t max_data_xfer_size_;
 
+  bool zrwa_open_all_zones_{true};
+
   std::thread *allocation_thread_;
   const int wal_zone_reserve_count_ = 2;
   const int wal_allocation_threshold_ = 5; // 5%
+  std::mutex wal_queue_mtx_;
   std::queue<Zone *> wal_zone_queue_;
   std::queue<Zone *> wal_finish_zone_queue_;
   std::atomic<int> wal_queue_cnt_;
@@ -176,6 +192,16 @@ class ZonedBlockDevice {
 
   void EncodeJsonZone(std::ostream &json_stream,
                       const std::vector<Zone *> zones);
+  int GetWalZoneReserveTarget() const;
+  int WalZoneDeficit() const;
+  bool CanAllocateMoreOpenZones(bool for_wal) const;
+  bool CanAllocateMoreActiveZones(bool for_wal) const;
+  void AccountZoneActiveChange(int delta);
+  void AccountZoneOpenChange(int delta);
+  IOStatus AllocateZoneFromPool(Env::WriteLifeTimeHint file_lifetime,
+                                Zone **out_zone, bool empty_only,
+                                bool for_wal);
+  IOStatus AllocateWalZone(Zone **out_zone, bool empty_only);
 
  public:
   explicit ZonedBlockDevice(std::string bdevname,
@@ -190,7 +216,8 @@ class ZonedBlockDevice {
 
   Zone *GetIOZone(uint64_t offset);
 
-  IOStatus AllocateZone(Env::WriteLifeTimeHint file_lifetime, Zone **out_zone);
+  IOStatus AllocateZone(Env::WriteLifeTimeHint file_lifetime, Zone **out_zone,
+                        bool empty_only = false);
   IOStatus AllocateMetaZone(Zone **out_meta_zone);
 
   uint64_t GetFreeSpace();
@@ -212,8 +239,8 @@ class ZonedBlockDevice {
 
   void SetFinishTreshold(uint32_t threshold) { finish_threshold_ = threshold; }
 
-  void NotifyIOZoneFull();
-  void NotifyIOZoneClosed();
+  void NotifyIOZoneFull(Zone *zone);
+  void NotifyIOZoneClosed(Zone *zone);
 
   void EncodeJson(std::ostream &json_stream);
 
@@ -227,6 +254,7 @@ class ZonedBlockDevice {
 
   void BackgroundJobForWAL(void);
   Zone *RetrieveWalZone(void);
+  Zone *TryRetrieveWalZone(void);
   bool CheckNewWalZoneNeeded(Zone *req_zone, uint64_t alba) {
     //req_zone->max_capacity_ * wal_allocation_threshold_ / 100
     if ((req_zone->start_ + req_zone->max_capacity_ - alba * 4096) < 1*1024*1024) { // 1MB fixed threshold
@@ -235,10 +263,7 @@ class ZonedBlockDevice {
       return false;
     }
   }
-  void FinishWalZone(Zone *req_zone) {
-    wal_finish_zone_queue_.push(req_zone);
-    wal_finish_queue_cnt_.fetch_add(1);
-  }
+  void FinishWalZone(Zone *req_zone);
   char *GetWalExtentBuffer(void) {
     return wal_update_extent_buffer_;
   }

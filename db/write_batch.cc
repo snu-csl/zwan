@@ -8,8 +8,8 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
 // WriteBatch::rep_ :=
-//    sequence: fixed64
 //    count: fixed32
+//    sequence: fixed64
 //    data: record[count]
 // record :=
 //    kTypeValue varstring varstring
@@ -763,19 +763,19 @@ void WriteBatchInternal::SetAsLatestPersistentState(WriteBatch* b) {
 }
 
 uint32_t WriteBatchInternal::Count(const WriteBatch* b) {
-  return DecodeFixed32(b->rep_.data() + 8);
+  return DecodeFixed32(b->rep_.data());
 }
 
 void WriteBatchInternal::SetCount(WriteBatch* b, uint32_t n) {
-  EncodeFixed32(&b->rep_[8], n);
+  EncodeFixed32(&b->rep_[0], n);
 }
 
 SequenceNumber WriteBatchInternal::Sequence(const WriteBatch* b) {
-  return SequenceNumber(DecodeFixed64(b->rep_.data()));
+  return SequenceNumber(DecodeFixed64(b->rep_.data() + 4));
 }
 
 void WriteBatchInternal::SetSequence(WriteBatch* b, SequenceNumber seq) {
-  EncodeFixed64(&b->rep_[0], seq);
+  EncodeFixed64(&b->rep_[4], seq);
 }
 
 size_t WriteBatchInternal::GetFirstOffset(WriteBatch* /*b*/) {

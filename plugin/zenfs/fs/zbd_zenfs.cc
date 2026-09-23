@@ -7,6 +7,7 @@
 #if !defined(ROCKSDB_LITE) && !defined(OS_WIN)
 
 #include "zbd_zenfs.h"
+#include "wal_zrwa.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -17,6 +18,7 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -28,6 +30,7 @@
 
 #include "rocksdb/env.h"
 #include "rocksdb/io_status.h"
+#include "monitoring/waf_stats.h"
 #include "snapshot.h"
 #include "spdk/nvme_zns.h"
 
@@ -120,10 +123,15 @@ void sync_completion(void *cb_arg, const struct spdk_nvme_cpl *cpl) {
   cb_type *cb_param = (cb_type *)cb_arg;
 
   if (spdk_nvme_cpl_is_error(cpl)) {
-    fprintf(stderr, "ZNS error on completion\n");
-
-    // in error case, stop running
-    while(1);
+#if defined(CB_ARG_DEBUG)
+    fprintf(stderr, "ZNS error on sync_completion: func=%s slba=0x%lx nlb=%lu qpair_idx=%u SCT=%u SC=%u\n",
+            cb_param->func_name, cb_param->slba, cb_param->nlb,
+            cb_param->idx, cpl->status.sct, cpl->status.sc);
+#else
+    fprintf(stderr, "ZNS error on sync_completion: SCT=%u SC=%u\n",
+            cpl->status.sct, cpl->status.sc);
+#endif
+    abort();
   }
 
   if (cb_arg != nullptr) {
@@ -142,6 +150,48 @@ void async_completion(void * /*cb_arg*/, const struct spdk_nvme_cpl *cpl) {
 }
 
 namespace ROCKSDB_NAMESPACE {
+
+bool zrwa_open_zone(Zone* zone, ZonedBlockDevice* zbd) {
+  uint64_t slba = zone->start_ >> zbd->GetBlockShift();
+
+  struct spdk_nvme_cmd cmd = {};
+  cmd.opc = 0x79;  // ZONE_MGMT_SEND
+  cmd.nsid = spdk_nvme_ns_get_id(g_stInfo->ns);
+  *(uint64_t*)&cmd.cdw10 = slba;
+  cmd.cdw13 = 0x3 | (1 << 9);  // ZSA=Open(0x3) | ZRWAA=1
+
+  cb_type cb_flag;
+  cb_flag.done = false;
+  cb_flag.fail = false;
+#if defined(CB_ARG_DEBUG)
+  cb_flag.idx = get_qpair_idx();
+  cb_flag.ns = g_stInfo->ns;
+  cb_flag.qpair = g_stInfo->qpair[get_qpair_idx()];
+  cb_flag.slba = slba;
+  cb_flag.nlb = 0;
+  memcpy(cb_flag.func_name, "ZRWAOpen", 16);
+#endif
+
+  int rc = spdk_nvme_ctrlr_cmd_io_raw(g_stInfo->ctrlr,
+      g_stInfo->qpair[get_qpair_idx()], &cmd, nullptr, 0,
+      sync_completion, &cb_flag);
+  if (rc != 0) {
+    fprintf(stderr, "ZRWA open submit failed slba=0x%lx rc=%d\n", slba, rc);
+    return false;
+  }
+
+  while (!cb_flag.done) {
+    spdk_nvme_qpair_process_completions(g_stInfo->qpair[get_qpair_idx()], 0);
+  }
+
+  if (cb_flag.fail) {
+    fprintf(stderr, "ZRWA open failed slba=0x%lx\n", slba);
+    return false;
+  }
+
+  zone->MarkWalZrwaOpened();
+  return true;
+}
 uint64_t zone_size;
 static void AllocationThread(void *_zbd) {
   ZonedBlockDevice *zbd = (ZonedBlockDevice *)_zbd;
@@ -154,6 +204,7 @@ static void AllocationThread(void *_zbd) {
 Zone::Zone(ZonedBlockDevice *zbd, struct spdk_nvme_zns_zone_desc *z)
     : zbd_(zbd),
       busy_(false),
+      wal_zrwa_opened_(false),
       start_(zbd_zone_start(z) << zbd->GetBlockShift()),
       max_capacity_(zbd_zone_capacity(z) << zbd->GetBlockShift()),
       wp_(zbd_zone_wp(z) << zbd->GetBlockShift()) {
@@ -173,9 +224,18 @@ uint64_t Zone::GetZoneNr() { return start_ / zbd_->GetZoneSize(); }
 IOStatus Zone::CloseWR() {
   assert(IsBusy());
 
+  if (WasWalZrwaOpened() && capacity_ == 0) {
+    IOStatus status = Finish();
+    if (!status.ok()) return status;
+    zbd_->NotifyIOZoneFull(this);
+    return IOStatus::OK();
+  }
+
   IOStatus status = Close();
 
-  if (capacity_ == 0) zbd_->NotifyIOZoneFull();
+  if (capacity_ == 0) {
+    zbd_->NotifyIOZoneFull(this);
+  }
 
   return status;
 }
@@ -257,6 +317,7 @@ IOStatus Zone::Reset() {
 
   wp_ = start_;
   lifetime_ = Env::WLTH_NOT_SET;
+  ClearWalZrwaOpened();
 
   free(report);
 
@@ -288,6 +349,7 @@ IOStatus Zone::ResetAsync() {
   if (ret) return IOStatus::IOError("Zone reset failed\n");
 
   async_cmd_count.fetch_add(1);
+  ClearWalZrwaOpened();
 
   return IOStatus::OK();
 }
@@ -317,6 +379,7 @@ IOStatus Zone::Finish() {
 
   capacity_ = 0;
   wp_ = start_ + zone_sz;
+  ClearWalZrwaOpened();
 
   return IOStatus::OK();
 }
@@ -353,7 +416,7 @@ IOStatus Zone::Close() {
 }
 
 
-IOStatus Zone::Append(char *data, uint32_t size, uint64_t *alba) {
+IOStatus Zone::Append(char *data, uint32_t size, uint64_t *alba, bool is_wal) {
   char *ptr = data;
   uint32_t left = size;
   int ret;
@@ -377,17 +440,23 @@ IOStatus Zone::Append(char *data, uint32_t size, uint64_t *alba) {
   while (!cb_flag.done) {
     spdk_nvme_qpair_process_completions(g_stInfo->qpair[get_qpair_idx()], 0);
   }
+
   if (alba) {
     *alba = cb_flag.alba;
   }
 
-  if (cb_flag.fail)
+  if (cb_flag.fail) {
     return IOStatus::NoSpace();
-  else
-    return IOStatus::OK();
+  }
+
+  AddTotalDeviceBytes(size);
+  if (is_wal) {
+    AddWalDeviceBytes(size);
+  }
+  return IOStatus::OK();
 }
 
-IOStatus Zone::Write(char *data, uint32_t size) {
+IOStatus Zone::Write(char *data, uint32_t size, bool is_wal) {
   char *ptr = data;
   uint32_t left = size;
   int ret;
@@ -426,6 +495,11 @@ IOStatus Zone::Write(char *data, uint32_t size) {
   while (!cb_flag.done) {
     spdk_nvme_qpair_process_completions(g_stInfo->qpair[get_qpair_idx()], 0);
   }
+
+  AddTotalDeviceBytes(size);
+  if (is_wal) {
+    AddWalDeviceBytes(size);
+  }
   }
 
   return IOStatus::OK();
@@ -457,6 +531,38 @@ ZonedBlockDevice::ZonedBlockDevice(std::string bdevname,
   Info(logger_, "New Zoned Block Device: %s", filename_.c_str());
   wal_queue_cnt_.store(0);
   wal_finish_queue_cnt_.store(0);
+  active_io_zones_.store(0);
+  open_io_zones_.store(0);
+}
+
+int ZonedBlockDevice::GetWalZoneReserveTarget() const {
+  return (waltz_wal_mode == "zrwa") ? 1 : wal_zone_reserve_count_;
+}
+
+int ZonedBlockDevice::WalZoneDeficit() const {
+  int target = GetWalZoneReserveTarget();
+  int current = wal_queue_cnt_.load(std::memory_order_relaxed);
+  return std::max(0, target - current);
+}
+
+bool ZonedBlockDevice::CanAllocateMoreOpenZones(bool for_wal) const {
+  long limit = static_cast<long>(max_nr_open_io_zones_);
+  if (!for_wal) limit -= WalZoneDeficit();
+  return open_io_zones_.load() < limit;
+}
+
+bool ZonedBlockDevice::CanAllocateMoreActiveZones(bool for_wal) const {
+  long limit = static_cast<long>(max_nr_active_io_zones_);
+  if (!for_wal) limit -= WalZoneDeficit();
+  return active_io_zones_.load() < limit;
+}
+
+void ZonedBlockDevice::AccountZoneActiveChange(int delta) {
+  active_io_zones_.fetch_add(delta, std::memory_order_relaxed);
+}
+
+void ZonedBlockDevice::AccountZoneOpenChange(int delta) {
+  open_io_zones_.fetch_add(delta, std::memory_order_relaxed);
 }
 
 std::string ZonedBlockDevice::ErrorToString(int err) {
@@ -517,7 +623,16 @@ Status ZonedBlockDevice::Format(){
 }
 
 // [JS] SPDK-related struct & definition
-#define NVME_ZNS_NAMESPACE (1) // we only use namespace 1
+static int get_zns_nsid() {
+  if (zns_pcie_addr.find("d8:00") != std::string::npos ||
+      zns_pcie_addr.find("af:00") != std::string::npos ||
+      zns_pcie_addr.find("86:00") != std::string::npos ||
+      zns_pcie_addr.find("5e:00") != std::string::npos ||
+      zns_pcie_addr.find("18:00") != std::string::npos)
+    return 2;  // All WD 2600 devices use ns2
+  return 1;
+}
+#define NVME_ZNS_NAMESPACE (get_zns_nsid())
 
 // [JS] SPDK probe callback
 static bool zns_probe(void * /*cb_ctx*/,
@@ -535,6 +650,14 @@ static void zns_attach(void * /*cb_ctx*/,
 
   g_stInfo->ctrlr = ctrlr;
   g_stInfo->ns    = spdk_nvme_ctrlr_get_ns(ctrlr, NVME_ZNS_NAMESPACE);
+
+  if (g_stInfo->ns == nullptr) {
+    fprintf(stderr, "Namespace %d not found\n", NVME_ZNS_NAMESPACE);
+    return;
+  }
+
+  uint8_t csi = spdk_nvme_ns_get_csi(g_stInfo->ns);
+
   g_stInfo->qpair = (struct spdk_nvme_qpair **)malloc(sizeof(struct spdk_nvme_qpair *) * NUM_WORKER_THREAD);
   for (int i = 0; i < NUM_WORKER_THREAD; i ++) {
     g_stInfo->qpair[i] = spdk_nvme_ctrlr_alloc_io_qpair(ctrlr, &qp_opts, sizeof(qp_opts));
@@ -543,11 +666,13 @@ static void zns_attach(void * /*cb_ctx*/,
 
   g_stInfo->maxqd = opts->io_queue_size;
 
-  if (spdk_nvme_ns_get_csi(g_stInfo->ns) == SPDK_NVME_CSI_ZNS) {
+  if (csi == SPDK_NVME_CSI_ZNS) {
     g_stInfo->zns = spdk_nvme_zns_ns_get_data(g_stInfo->ns);
     if (spdk_nvme_ctrlr_get_flags(ctrlr) & SPDK_NVME_CTRLR_ZONE_APPEND_SUPPORTED) {
       g_stInfo->append_support = true;
     }
+  } else {
+    fprintf(stderr, "Namespace %d is not ZNS (CSI=%d)\n", NVME_ZNS_NAMESPACE, csi);
   }
   g_stInfo->valid = true;
 }
@@ -572,11 +697,21 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
 
     spdk_env_opts_init(&opts);
     opts.name = "ZNS";
+    opts.mem_size = 0;      // use all available hugepages
+    opts.mem_channel = 1;
     spdk_env_init(&opts);
 
     memset(&trid_pcie, 0, sizeof(trid_pcie));
-    trid_pcie.trtype = SPDK_NVME_TRANSPORT_PCIE;
-    memcpy(trid_pcie.traddr, zns_pcie_addr.c_str(), sizeof(char) * 13);
+    spdk_nvme_trid_populate_transport(&trid_pcie, SPDK_NVME_TRANSPORT_PCIE);
+    snprintf(trid_pcie.subnqn, sizeof(trid_pcie.subnqn), "%s", SPDK_NVMF_DISCOVERY_NQN);
+    {
+      std::string traddr_str = "trtype:PCIe traddr:" + zns_pcie_addr;
+      if (spdk_nvme_transport_id_parse(&trid_pcie, traddr_str.c_str()) != 0) {
+        fprintf(stderr, "Error parsing transport address: %s\n", traddr_str.c_str());
+      }
+      spdk_nvme_transport_id_populate_trstring(&trid_pcie,
+          spdk_nvme_transport_id_trtype_str(trid_pcie.trtype));
+    }
     spdk_nvme_probe(&trid_pcie, nullptr, zns_probe, zns_attach, nullptr);
 
     spdk_unaffinitize_thread();
@@ -592,7 +727,11 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
     wal_update_extent_buffer_ = (char *)spdk_zmalloc(4096, sysconf(_SC_PAGESIZE), 0, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
   }
 
-  blk_sft_  = spdk_nvme_ns_get_data(g_stInfo->ns)->lbaf->lbads;
+  {
+    const struct spdk_nvme_ns_data *nsdata = spdk_nvme_ns_get_data(g_stInfo->ns);
+    uint8_t flbas_idx = nsdata->flbas.format;  // active LBA format index
+    blk_sft_ = nsdata->lbaf[flbas_idx].lbads;
+  }
   block_sz_ = (1 << blk_sft_);
   blk_msk_  = ~((((uint64_t)1) << blk_sft_) - 1);
   zone_sz_  = spdk_nvme_zns_ns_get_zone_size(g_stInfo->ns);
@@ -607,17 +746,26 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
    */
   uint32_t max_nr_active_zones_from_dev =
     spdk_nvme_zns_ns_get_max_active_zones(g_stInfo->ns);
+  uint32_t max_nr_open_zones_from_dev =
+    spdk_nvme_zns_ns_get_max_open_zones(g_stInfo->ns);
+
+  uint32_t reserved_zones = 1;  // reserve 1 slot for metadata zone
+
   if (max_nr_active_zones_from_dev == 0)
     max_nr_active_io_zones_ = nr_zones_;
   else
-    max_nr_active_io_zones_ = max_nr_active_zones_from_dev - 1;
+    max_nr_active_io_zones_ =
+        (max_nr_active_zones_from_dev > reserved_zones)
+            ? max_nr_active_zones_from_dev - reserved_zones
+            : 0;
 
-  uint32_t max_nr_open_zones_from_dev =
-    spdk_nvme_zns_ns_get_max_open_zones(g_stInfo->ns);
   if (max_nr_open_zones_from_dev == 0)
     max_nr_open_io_zones_ = nr_zones_;
   else
-    max_nr_open_io_zones_ = max_nr_open_zones_from_dev - 1;
+    max_nr_open_io_zones_ =
+        (max_nr_open_zones_from_dev > reserved_zones)
+            ? max_nr_open_zones_from_dev - reserved_zones
+            : 0;
 
   Info(logger_, "Zone block device nr zones: %u max active: %u max open: %u \n",
        nr_zones_, max_nr_active_zones_from_dev, max_nr_open_zones_from_dev);
@@ -688,9 +836,6 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
     }
   }
 
-  active_io_zones_ = 0;
-  open_io_zones_ = 0;
-
   for (; i < nr_zones_; i++) {
     struct spdk_nvme_zns_zone_desc *z = &report->descs[i];
     /* Only use sequential write required zones */
@@ -703,14 +848,13 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
                                       std::to_string(newZone->GetZoneNr()));
         }
         io_zones.push_back(newZone);
-        if (zbd_zone_imp_open(z) || zbd_zone_exp_open(z) ||
-            zbd_zone_closed(z)) {
-          active_io_zones_++;
-          if (zbd_zone_imp_open(z) || zbd_zone_exp_open(z)) {
-            if (!readonly) {
-              newZone->Close();
-            }
-          }
+        // closing a ZRWA-opened zone drops pages still inside the ZRWA
+        // window, recovery must read them before the zone is closed
+        bool skip_auto_close = (waltz_wal_mode == "zrwa") &&
+                               (zbd_zone_wp(z) > zbd_zone_start(z));
+        if ((zbd_zone_imp_open(z) || zbd_zone_exp_open(z)) && !readonly &&
+            !skip_auto_close) {
+          newZone->Close();
         }
         IOStatus status = newZone->CheckRelease();
         if (!status.ok()) return status;
@@ -718,22 +862,33 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
     }
   }
 
+  active_io_zones_.store(0, std::memory_order_relaxed);
+  open_io_zones_.store(0, std::memory_order_relaxed);
+  for (const auto z : io_zones) {
+    if (!z->IsEmpty() && !z->IsFull()) {
+      AccountZoneActiveChange(1);
+    }
+  }
+
   free(report_xferbuf);
   free(report);
   start_time_ = time(NULL);
 
+  // nsid 1 opens ZRWA on every zone, nsid 2 only on WAL zones
+  zrwa_open_all_zones_ = (waltz_wal_mode == "zrwa" && get_zns_nsid() == 1);
+
   return IOStatus::OK();
 }
 
-void ZonedBlockDevice::NotifyIOZoneFull() {
+void ZonedBlockDevice::NotifyIOZoneFull(Zone *zone) {
   const std::lock_guard<std::mutex> lock(zone_resources_mtx_);
-  active_io_zones_--;
+  AccountZoneActiveChange(-1);
   zone_resources_.notify_one();
 }
 
-void ZonedBlockDevice::NotifyIOZoneClosed() {
+void ZonedBlockDevice::NotifyIOZoneClosed(Zone *zone) {
   const std::lock_guard<std::mutex> lock(zone_resources_mtx_);
-  open_io_zones_--;
+  AccountZoneOpenChange(-1);
   zone_resources_.notify_one();
 }
 
@@ -762,6 +917,11 @@ uint64_t ZonedBlockDevice::GetReclaimableSpace() {
 }
 
 void ZonedBlockDevice::LogZoneStats() {
+  static time_t last_log_time = 0;
+  time_t now = time(NULL);
+  if (now - last_log_time < 10) return;  // at most once per 10 seconds
+  last_log_time = now;
+
   uint64_t used_capacity = 0;
   uint64_t reclaimable_capacity = 0;
   uint64_t reclaimables_max_capacity = 0;
@@ -783,11 +943,12 @@ void ZonedBlockDevice::LogZoneStats() {
 
   Info(logger_,
        "[Zonestats:time(s),used_cap(MB),reclaimable_cap(MB), "
-       "avg_reclaimable(%%), active(#), active_zones(#), open_zones(#)] %ld "
-       "%lu %lu %lu %lu %ld %ld\n",
+       "avg_reclaimable(%%), active(#), active_total(#), "
+       "open_total(#)] %ld %lu %lu %lu %lu %ld %ld\n",
        time(NULL) - start_time_, used_capacity / MB, reclaimable_capacity / MB,
        100 * reclaimable_capacity / reclaimables_max_capacity, active,
-       active_io_zones_.load(), open_io_zones_.load());
+       active_io_zones_.load(std::memory_order_relaxed),
+       open_io_zones_.load(std::memory_order_relaxed));
 
   io_zones_mtx.unlock();
 }
@@ -804,6 +965,12 @@ void ZonedBlockDevice::LogZoneUsage() {
 }
 
 ZonedBlockDevice::~ZonedBlockDevice() {
+  // Shutdown ZRWA before destroying zones
+  if (rocksdb::g_wal_zrwa) {
+    delete rocksdb::g_wal_zrwa;
+    rocksdb::g_wal_zrwa = nullptr;
+  }
+
   for (const auto z : meta_zones) {
     delete z;
   }
@@ -814,7 +981,11 @@ ZonedBlockDevice::~ZonedBlockDevice() {
 
   if (waltz_mode) {
     g_bAllocationRunning = false;
-    allocation_thread_->join();
+    if (allocation_thread_) {
+      allocation_thread_->join();
+      delete allocation_thread_;
+      allocation_thread_ = nullptr;
+    }
   }
 }
 
@@ -869,8 +1040,17 @@ Status ZonedBlockDevice::ResetUnusedIOZones() {
   /* Reset any unused zones */
   for (const auto z : io_zones) {
     if (z->Acquire()) {
+      // keep zones that still carry unflushed bytes for the recovery path
+      if (waltz_wal_mode == "zrwa" && !z->IsUsed() && !z->IsEmpty() &&
+          z->wp_ > z->start_) {
+        IOStatus status = z->CheckRelease();
+        if (!status.ok()) return status;
+        continue;
+      }
       if (!z->IsUsed() && !z->IsEmpty()) {
-        if (!z->IsFull()) active_io_zones_--;
+        if (!z->IsFull()) {
+          AccountZoneActiveChange(-1);
+        }
         if (!z->Reset().ok()) Warn(logger_, "Failed reseting zone");
       }
       IOStatus status = z->CheckRelease();
@@ -880,8 +1060,9 @@ Status ZonedBlockDevice::ResetUnusedIOZones() {
   return Status::OK();
 }
 
-IOStatus ZonedBlockDevice::AllocateZone(Env::WriteLifeTimeHint file_lifetime,
-                                        Zone **out_zone) {
+IOStatus ZonedBlockDevice::AllocateZoneFromPool(
+    Env::WriteLifeTimeHint file_lifetime, Zone **out_zone, bool empty_only,
+    bool for_wal) {
   Zone *allocated_zone = nullptr;
   Zone *finish_victim = nullptr;
   unsigned int best_diff = LIFETIME_DIFF_NOT_GOOD;
@@ -903,13 +1084,17 @@ IOStatus ZonedBlockDevice::AllocateZone(Env::WriteLifeTimeHint file_lifetime,
 
   io_zones_mtx.lock();
 
-  /* Make sure we are below the zone open limit */
-  {
-    std::unique_lock<std::mutex> lk(zone_resources_mtx_);
-    zone_resources_.wait(lk, [this] {
-      if (open_io_zones_.load() < max_nr_open_io_zones_) return true;
-      return false;
-    });
+  /* Make sure we are below the zone open limit. io_zones_mtx is released
+   * around the wait, the allocation thread needs it to free a zone. */
+  while (!CanAllocateMoreOpenZones(for_wal)) {
+    io_zones_mtx.unlock();
+    {
+      std::unique_lock<std::mutex> lk(zone_resources_mtx_);
+      zone_resources_.wait(lk, [this, for_wal] {
+        return CanAllocateMoreOpenZones(for_wal);
+      });
+    }
+    io_zones_mtx.lock();
   }
 
   /* Reset any unused zones and finish used zones under capacity treshold*/
@@ -925,7 +1110,16 @@ IOStatus ZonedBlockDevice::AllocateZone(Env::WriteLifeTimeHint file_lifetime,
     }
 
     if (!z->IsUsed()) {
-      if (!z->IsFull()) active_io_zones_--;
+      // wp > start means unflushed WAL bytes with no metadata yet, recovery
+      // claims the zone later and resetting it here would wipe the WAL
+      if (waltz_wal_mode == "zrwa" && z->wp_ > z->start_) {
+        IOStatus status = z->CheckRelease();
+        if (!status.ok()) return status;
+        continue;
+      }
+      if (!z->IsFull()) {
+        AccountZoneActiveChange(-1);
+      }
       s = z->Reset();
       if (!s.ok()) {
         Debug(logger_, "Failed resetting zone !");
@@ -945,7 +1139,7 @@ IOStatus ZonedBlockDevice::AllocateZone(Env::WriteLifeTimeHint file_lifetime,
         Debug(logger_, "Failed finishing zone");
         return s;
       }
-      active_io_zones_--;
+      AccountZoneActiveChange(-1);
     }
 
     if (!z->IsFull()) {
@@ -968,6 +1162,7 @@ IOStatus ZonedBlockDevice::AllocateZone(Env::WriteLifeTimeHint file_lifetime,
   // Holding finish_victim if != nullptr
 
   /* Try to fill an already open zone(with the best life time diff) */
+  if (empty_only) goto find_empty;
   for (const auto z : io_zones) {
     if (z->Acquire()) {
       if ((z->used_capacity_ > 0) && !z->IsFull()) {
@@ -993,31 +1188,31 @@ IOStatus ZonedBlockDevice::AllocateZone(Env::WriteLifeTimeHint file_lifetime,
   // Holding finish_victim if != nullptr
   // Holding allocated_zone if != nullptr
 
+find_empty:
   /* If we did not find a good match, allocate an empty one */
-  if (best_diff >= LIFETIME_DIFF_NOT_GOOD) {
+  if (empty_only || best_diff >= LIFETIME_DIFF_NOT_GOOD) {
     /* If we at the active io zone limit, finish an open zone(if available) with
      * least capacity left */
-    if (active_io_zones_.load() == max_nr_active_io_zones_ &&
-        finish_victim != nullptr) {
+    if (!CanAllocateMoreActiveZones(for_wal) && finish_victim != nullptr) {
       s = finish_victim->Finish();
       if (!s.ok()) {
         Debug(logger_, "Failed finishing zone");
         return s;
       }
-      active_io_zones_--;
+      AccountZoneActiveChange(-1);
     }
 
-    if (active_io_zones_.load() < max_nr_active_io_zones_) {
+    if (CanAllocateMoreActiveZones(for_wal)) {
       for (const auto z : io_zones) {
         if (z->Acquire()) {
-          if (z->IsEmpty()) {
+          if (z->IsEmpty() && z->capacity_ > 0) {
             z->lifetime_ = file_lifetime;
             if (allocated_zone != nullptr) {
               IOStatus status = allocated_zone->CheckRelease();
               if (!status.ok()) return status;
             }
             allocated_zone = z;
-            active_io_zones_++;
+            AccountZoneActiveChange(1);
             new_zone = 1;
             break;
           } else {
@@ -1038,10 +1233,24 @@ IOStatus ZonedBlockDevice::AllocateZone(Env::WriteLifeTimeHint file_lifetime,
   if (allocated_zone) {
     ok = allocated_zone->IsBusy();
     assert(ok);
-    open_io_zones_++;
+    // unified mode only, WAL-only mode opens ZRWA in BackgroundJobForWAL
+    if (waltz_wal_mode == "zrwa" && zrwa_open_all_zones_) {
+      if (!zrwa_open_zone(allocated_zone, this)) {
+        if (new_zone) AccountZoneActiveChange(-1);
+        IOStatus status = allocated_zone->CheckRelease();
+        if (!status.ok()) return status;
+        allocated_zone = nullptr;
+        *out_zone = nullptr;
+        io_zones_mtx.unlock();
+        return IOStatus::OK();
+      }
+    }
+    AccountZoneOpenChange(1);
     Debug(logger_,
-          "Allocating zone(new=%d) start: 0x%lx wp: 0x%lx lt: %d file lt: %d\n",
-          new_zone, allocated_zone->start_, allocated_zone->wp_,
+          "Allocating zone(new=%d) start: 0x%lx wp: 0x%lx lt: %d "
+          "file lt: %d\n",
+          new_zone, allocated_zone->start_,
+          allocated_zone->wp_,
           allocated_zone->lifetime_, file_lifetime);
   }
 
@@ -1054,6 +1263,15 @@ IOStatus ZonedBlockDevice::AllocateZone(Env::WriteLifeTimeHint file_lifetime,
   metrics_->ReportGeneral(ZENFS_ACTIVE_ZONES, active_io_zones_);
 
   return IOStatus::OK();
+}
+
+IOStatus ZonedBlockDevice::AllocateZone(Env::WriteLifeTimeHint file_lifetime,
+                                        Zone **out_zone, bool empty_only) {
+  return AllocateZoneFromPool(file_lifetime, out_zone, empty_only, false);
+}
+
+IOStatus ZonedBlockDevice::AllocateWalZone(Zone **out_zone, bool empty_only) {
+  return AllocateZoneFromPool(Env::WLTH_SHORT, out_zone, empty_only, true);
 }
 
 std::string ZonedBlockDevice::GetFilename() { return filename_; }
@@ -1106,25 +1324,57 @@ void ZonedBlockDevice::GetZoneSnapshot(std::vector<ZoneSnapshot> &snapshot) {
 }
 
 void ZonedBlockDevice::BackgroundJobForWAL() {
-  if (wal_queue_cnt_.load() < wal_zone_reserve_count_) {
-    Zone *n_zone;
-    IOStatus s = AllocateZone(Env::WLTH_SHORT, &n_zone);
-    if (s.ok()) {
-      wal_zone_queue_.push(n_zone);
-      wal_queue_cnt_.fetch_add(1);
-    }
-  }
   if (wal_finish_queue_cnt_.load()) {
-    Zone *f_zone = wal_finish_zone_queue_.front();
-    wal_finish_zone_queue_.pop();
-    wal_finish_queue_cnt_.fetch_sub(1);
-    if (f_zone->capacity_) {
+    Zone *f_zone;
+    {
+      std::lock_guard<std::mutex> lk(wal_queue_mtx_);
+      f_zone = wal_finish_zone_queue_.front();
+      wal_finish_zone_queue_.pop();
+      wal_finish_queue_cnt_.fetch_sub(1);
+    }
+    if (f_zone->WasWalZrwaOpened() || f_zone->capacity_) {
       f_zone->Finish();
     }
-    NotifyIOZoneFull();
+    NotifyIOZoneFull(f_zone);
     f_zone->Close();
-    NotifyIOZoneClosed();
+    NotifyIOZoneClosed(f_zone);
     f_zone->Release();
+    /* return after finish, the freed active slot must become visible to
+     * compaction before a new WAL zone takes it */
+    return;
+  }
+
+  if (wal_queue_cnt_.load() < GetWalZoneReserveTarget()) {
+    // defer refill until the retiring zone Finish completes, WAL keeps at
+    // most two device-active zones
+    if (rocksdb::g_wal_zrwa != nullptr &&
+        !rocksdb::g_wal_zrwa->getIoThread()->isWalFinishComplete())
+      return;
+
+    Zone *n_zone;
+    bool need_empty = !zrwa_open_all_zones_ && waltz_wal_mode == "zrwa";
+    IOStatus s = AllocateWalZone(&n_zone, need_empty);
+    if (s.ok()) {
+      if (n_zone == nullptr) {
+        return;
+      }
+      // WAL-only mode opens the zone from the WalZrwa IO thread
+      if (need_empty && rocksdb::g_wal_zrwa != nullptr) {
+        if (!rocksdb::g_wal_zrwa->openZoneZrwaSync(n_zone)) {
+          fprintf(stderr, "ZRWA open failed slba=0x%lx\n",
+                  n_zone->start_ >> blk_sft_);
+          NotifyIOZoneFull(n_zone);
+          NotifyIOZoneClosed(n_zone);
+          n_zone->Release();
+          return;
+        }
+      }
+      {
+        std::lock_guard<std::mutex> lk(wal_queue_mtx_);
+        wal_zone_queue_.push(n_zone);
+        wal_queue_cnt_.fetch_add(1);
+      }
+    }
   }
 }
 Zone *ZonedBlockDevice::RetrieveWalZone() {
@@ -1135,12 +1385,40 @@ Zone *ZonedBlockDevice::RetrieveWalZone() {
   Zone *zone = nullptr;
   do {
     if (wal_queue_cnt_.load()) {
-      zone = wal_zone_queue_.front();
-      wal_zone_queue_.pop();
-      wal_queue_cnt_.fetch_sub(1);
+      std::lock_guard<std::mutex> lk(wal_queue_mtx_);
+      if (!wal_zone_queue_.empty()) {
+        zone = wal_zone_queue_.front();
+        wal_zone_queue_.pop();
+        wal_queue_cnt_.fetch_sub(1);
+      }
     }
   } while (zone == nullptr);
   return zone;
+}
+
+Zone *ZonedBlockDevice::TryRetrieveWalZone() {
+  if (!g_bAllocationRunning) {
+    g_bAllocationRunning = true;
+    allocation_thread_ = new std::thread(AllocationThread, this);
+  }
+  if (wal_queue_cnt_.load()) {
+    std::lock_guard<std::mutex> lk(wal_queue_mtx_);
+    if (!wal_zone_queue_.empty()) {
+      Zone *zone = wal_zone_queue_.front();
+      wal_zone_queue_.pop();
+      wal_queue_cnt_.fetch_sub(1);
+      return zone;
+    }
+  }
+  return nullptr;
+}
+
+void ZonedBlockDevice::FinishWalZone(Zone *req_zone) {
+  {
+    std::lock_guard<std::mutex> lk(wal_queue_mtx_);
+    wal_finish_zone_queue_.push(req_zone);
+    wal_finish_queue_cnt_.fetch_add(1);
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE

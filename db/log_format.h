@@ -35,7 +35,9 @@ enum RecordType {
 };
 static const int kMaxRecordType = kRecyclableLastType;
 
-static const unsigned int kBlockSize = 32768;
+// Set at process init, 4 KiB for one record per device page
+extern unsigned int kBlockSize;
+void SetBlockSize(unsigned int size);
 
 // Header is checksum (4 bytes), length (2 bytes), type (1 byte)
 static const int kHeaderSize = 4 + 2 + 1;

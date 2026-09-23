@@ -7,6 +7,7 @@
 #if !defined(ROCKSDB_LITE) && defined(OS_LINUX)
 
 #include "fs_zenfs.h"
+#include "wal_zrwa.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -20,6 +21,7 @@
 #include <vector>
 
 #include "metrics_sample.h"
+#include "monitoring/waf_stats.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "snapshot.h"
 #include "util/coding.h"
@@ -28,6 +30,7 @@
 #define DEFAULT_ZENV_LOG_PATH "/tmp/"
 
 extern bool waltz_mode;
+extern std::string waltz_wal_mode;
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -92,6 +95,8 @@ void Superblock::GetReport(std::string* reportString) {
   reportString->append(std::to_string(superblock_version_));
   reportString->append("\nFlags [Decimal]:\t\t");
   reportString->append(std::to_string(flags_));
+  reportString->append("\nZRWA WAL Flag:\t\t\t");
+  reportString->append((flags_ & FLAG_ZRWA_WAL) ? "set" : "unset");
   reportString->append("\nBlock Size [Bytes]:\t\t");
   reportString->append(std::to_string(block_size_));
   reportString->append("\nZone Size [Blocks]:\t\t");
@@ -150,7 +155,8 @@ IOStatus ZenMetaLog::AddRecord(const Slice& slice) {
   EncodeFixed32(buffer + sizeof(uint32_t), record_sz);
   memcpy(buffer + sizeof(uint32_t) * 2, data, record_sz);
 
-  s = zone_->Write(buffer, phys_sz);
+  s = zone_->Write(buffer, phys_sz, /*is_wal=*/false);
+  if (s.ok()) AddMetaDeviceBytes(phys_sz);
 
   spdk_free(buffer);
   return s;
@@ -315,6 +321,42 @@ void ZenFS::ClearFiles() {
   files_.clear();
 }
 
+void ZenFS::MarkWalSimulatedCrash() {
+  std::lock_guard<std::mutex> file_lock(files_mtx_);
+  for (auto& kv : files_) {
+    auto& zf = kv.second;
+    if (!zf || !zf->IsWal()) continue;
+    zf->MarkSimulatedCrash();
+  }
+}
+
+void ZenFS::SimulateCrash() {
+  {
+    std::lock_guard<std::mutex> file_lock(files_mtx_);
+    std::vector<std::string> wal_names;
+    for (auto& kv : files_) {
+      auto& zf = kv.second;
+      if (!zf || !zf->IsWal()) continue;
+      // Mark again in case the caller skipped MarkWalSimulatedCrash
+      zf->MarkSimulatedCrash();
+      wal_names.push_back(kv.first);
+    }
+    for (auto& n : wal_names) files_.erase(n);
+  }
+
+  if (g_wal_zrwa) {
+    g_wal_zrwa->simulateCrash();
+    delete g_wal_zrwa;
+    g_wal_zrwa = nullptr;
+  }
+
+  // Drop the LOCK file so the next open is not blocked by a stale lock
+  IOOptions opts;
+  target()->DeleteFile(ToAuxPath("LOCK"), opts, nullptr).PermitUncheckedError();
+
+  fprintf(stderr, "ZenFS simulated crash\n");
+}
+
 /* Assumes that files_mutex_ is held */
 IOStatus ZenFS::WriteSnapshotLocked(ZenMetaLog* meta_log) {
   IOStatus s;
@@ -336,6 +378,19 @@ IOStatus ZenFS::WriteEndRecord(ZenMetaLog* meta_log) {
 
   PutFixed32(&endRecord, kEndRecord);
   return meta_log->AddRecord(endRecord);
+}
+
+/* Recover in-flight extents that were durable on the device but never
+ * reached the superblock. Call under files_mtx_ before the first write. */
+IOStatus ZenFS::Repair() {
+  for (auto& it : files_) {
+    auto& zFile = it.second;
+    if (zFile->HasActiveExtent()) {
+      IOStatus s = zFile->Recover();
+      if (!s.ok()) return s;
+    }
+  }
+  return IOStatus::OK();
 }
 
 /* Assumes the files_mtx_ is held */
@@ -498,7 +553,12 @@ IOStatus ZenFS::NewSequentialFile(const std::string& fname,
 
   if (fname.substr(fname.size() - 3, 3) == "log") {
     // for WAL file, recover the file size field by retrieving write pointer of active zone
-    zoneFile->Recover();
+    IOStatus rs = zoneFile->Recover();
+    if (!rs.ok()) {
+      Error(logger_, "WAL recovery failed for %s: %s", fname.c_str(),
+            rs.ToString().c_str());
+      return rs;
+    }
   }
 
   result->reset(new ZonedSequentialFile(zoneFile, file_opts));
@@ -1029,6 +1089,22 @@ Status ZenFS::Mount(bool readonly) {
   superblock_ = std::move(valid_superblocks[r]);
   zbd_->SetFinishTreshold(superblock_->GetFinishTreshold());
 
+  // Mixing WAL modes on the same file system corrupts silently
+  {
+    bool db_zrwa = superblock_->HasZrwaFlag();
+    bool run_zrwa = (waltz_wal_mode == "zrwa");
+    if (db_zrwa != run_zrwa) {
+      Error(logger_, "WAL mode mismatch: DB=%s, run=%s",
+            db_zrwa ? "zrwa" : "append", waltz_wal_mode.c_str());
+      return Status::InvalidArgument(
+          "ZenFS WAL mode mismatch",
+          std::string("DB created with ") + (db_zrwa ? "zrwa" : "append") +
+              ", running with " + waltz_wal_mode +
+              ". Re-create FS with mkfs.zenfs --waltz_wal_mode=" +
+              (db_zrwa ? "zrwa" : "append"));
+    }
+  }
+
   IOOptions foo;
   IODebugContext bar;
   s = target()->CreateDirIfMissing(superblock_->GetAuxFsPath(), foo, &bar);
@@ -1051,7 +1127,27 @@ Status ZenFS::Mount(bool readonly) {
   if (readonly) {
     Info(logger_, "Mounting READ ONLY");
   } else {
+    /* Init after RecoverFrom has rebuilt used_capacity_, and before Repair,
+     * which reads the hardware write pointer of zrwa files. */
+    if (waltz_wal_mode == "zrwa" && rocksdb::g_wal_zrwa == nullptr) {
+      rocksdb::g_wal_zrwa = new rocksdb::WalZrwa();
+      if (!rocksdb::g_wal_zrwa->init(zbd_)) {
+        delete rocksdb::g_wal_zrwa;
+        rocksdb::g_wal_zrwa = nullptr;
+        Error(logger_, "WalZrwa init failed in zrwa mode");
+        return Status::IOError(
+            "WalZrwa init failed in zrwa mode "
+            "(check that DB was created with --waltz_wal_mode=zrwa)");
+      }
+    }
+
     std::lock_guard<std::mutex> lock(files_mtx_);
+    IOStatus rs = Repair();
+    if (!rs.ok()) {
+      Error(logger_, "Failed to recover in-flight extents: %s",
+            rs.ToString().c_str());
+      return Status::IOError("ZenFS::Repair failed: " + rs.ToString());
+    }
     s = RollMetaZoneLocked();
     if (!s.ok()) {
       Error(logger_, "Failed to roll metadata zone.");
@@ -1120,6 +1216,9 @@ Status ZenFS::MkFS(std::string aux_fs_path, uint32_t finish_threshold) {
   log.reset(new ZenMetaLog(zbd_, meta_zone));
 
   Superblock super(zbd_, aux_fs_path, finish_threshold);
+  if (waltz_wal_mode == "zrwa") {
+    super.SetZrwaFlag();
+  }
   std::string super_string;
   super.EncodeTo(&super_string);
 

@@ -193,9 +193,10 @@ std::string HistogramStat::ToString() const {
   r.append(buf);
   snprintf(buf, sizeof(buf),
            "Percentiles: "
-           "P50: %.2f P75: %.2f P99: %.2f P99.9: %.2f P99.99: %.2f\n",
+           "P50: %.2f P75: %.2f P99: %.2f P99.9: %.2f P99.99: %.2f "
+           "P99.999: %.2f P99.9999: %.2f\n",
            Percentile(50), Percentile(75), Percentile(99), Percentile(99.9),
-           Percentile(99.99));
+           Percentile(99.99), Percentile(99.999), Percentile(99.9999));
   r.append(buf);
   r.append("------------------------------------------------------\n");
   if (cur_num == 0) return r;   // all buckets are empty

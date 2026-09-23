@@ -6,6 +6,8 @@
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
+#include <atomic>
+#include <chrono>
 #include <cinttypes>
 
 #include "db/builder.h"
@@ -23,7 +25,31 @@
 #include "test_util/sync_point.h"
 #include "util/rate_limiter.h"
 
+extern std::string waltz_wal_mode;
+
 namespace ROCKSDB_NAMESPACE {
+
+// WAL replay time breakdown, accumulated by RecoverLogFiles and printed
+// after it returns. Extent recovery is counted in ZoneFile::Recover.
+extern std::atomic<uint64_t> g_wal_extent_recover_ns;
+extern std::atomic<uint64_t> g_wal_extent_recover_count;
+std::atomic<uint64_t> g_wal_replay_read_ns{0};
+std::atomic<uint64_t> g_wal_replay_insert_ns{0};
+std::atomic<uint64_t> g_wal_replay_flush_ns{0};
+std::atomic<uint64_t> g_wal_replay_total_ns{0};
+// WAL bytes and IOs actually issued to the device, counted in
+// ZoneFile::PositionedRead for .log files
+std::atomic<uint64_t> g_wal_read_dev_bytes{0};
+std::atomic<uint64_t> g_wal_read_dev_ios{0};
+
+namespace {
+uint64_t ElapsedNs(std::chrono::steady_clock::time_point since) {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now() - since)
+      .count();
+}
+}  // namespace
+
 Options SanitizeOptions(const std::string& dbname, const Options& src,
                         bool read_only) {
   auto db_options = SanitizeOptions(dbname, DBOptions(src), read_only);
@@ -633,8 +659,54 @@ Status DBImpl::Recover(
       std::sort(wals.begin(), wals.end());
 
       bool corrupted_wal_found = false;
+      // WAL replay time alone, without manifest recovery or file system mount
+      uint64_t waltz_recover_start_us =
+          immutable_db_options_.clock->NowMicros();
+      uint64_t wal_read_bytes_before =
+          g_wal_read_dev_bytes.load(std::memory_order_relaxed);
+      uint64_t wal_read_ios_before =
+          g_wal_read_dev_ios.load(std::memory_order_relaxed);
       s = RecoverLogFiles(wals, &next_sequence, read_only,
                           &corrupted_wal_found);
+      uint64_t waltz_recover_end_us =
+          immutable_db_options_.clock->NowMicros();
+      fprintf(stderr,
+              "[WALTZ] RecoverLogFiles: %.3f ms (wal_files=%zu, status=%s)\n",
+              (waltz_recover_end_us - waltz_recover_start_us) / 1000.0,
+              wals.size(), s.ok() ? "ok" : s.ToString().c_str());
+      {
+        uint64_t read_bytes =
+            g_wal_read_dev_bytes.load(std::memory_order_relaxed) -
+            wal_read_bytes_before;
+        uint64_t read_ios =
+            g_wal_read_dev_ios.load(std::memory_order_relaxed) -
+            wal_read_ios_before;
+        fprintf(stderr, "[WAL_READ] dev_bytes=%llu ios=%llu blocks4k=%llu\n",
+                (unsigned long long)read_bytes, (unsigned long long)read_ios,
+                (unsigned long long)(read_bytes >> 12));
+      }
+      {
+        uint64_t extent_ns =
+            g_wal_extent_recover_ns.load(std::memory_order_relaxed);
+        uint64_t read_ns = g_wal_replay_read_ns.load(std::memory_order_relaxed);
+        uint64_t insert_ns =
+            g_wal_replay_insert_ns.load(std::memory_order_relaxed);
+        uint64_t flush_ns =
+            g_wal_replay_flush_ns.load(std::memory_order_relaxed);
+        uint64_t total_ns =
+            g_wal_replay_total_ns.load(std::memory_order_relaxed);
+        uint64_t known_ns = extent_ns + read_ns + insert_ns + flush_ns;
+        uint64_t other_ns = total_ns > known_ns ? total_ns - known_ns : 0;
+        fprintf(stderr,
+                "[WAL_REPLAY] total_us=%.3f extent_recover_us=%.3f "
+                "extent_recover_count=%lu read_us=%.3f "
+                "memtable_insert_us=%.3f l0_flush_us=%.3f other_us=%.3f\n",
+                total_ns / 1000.0, extent_ns / 1000.0,
+                (unsigned long)g_wal_extent_recover_count.load(
+                    std::memory_order_relaxed),
+                read_ns / 1000.0, insert_ns / 1000.0, flush_ns / 1000.0,
+                other_ns / 1000.0);
+      }
       if (corrupted_wal_found && recovered_seq != nullptr) {
         *recovered_seq = next_sequence;
       }
@@ -809,6 +881,23 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
 
   mutex_.AssertHeld();
   Status status;
+
+  g_wal_extent_recover_ns.store(0, std::memory_order_relaxed);
+  g_wal_extent_recover_count.store(0, std::memory_order_relaxed);
+  g_wal_replay_read_ns.store(0, std::memory_order_relaxed);
+  g_wal_replay_insert_ns.store(0, std::memory_order_relaxed);
+  g_wal_replay_flush_ns.store(0, std::memory_order_relaxed);
+  g_wal_replay_total_ns.store(0, std::memory_order_relaxed);
+  struct ReplayTimer {
+    std::chrono::steady_clock::time_point start;
+    ReplayTimer() : start(std::chrono::steady_clock::now()) {}
+    ~ReplayTimer() {
+      g_wal_replay_total_ns.fetch_add(ElapsedNs(start),
+                                      std::memory_order_relaxed);
+    }
+  } replay_timer;
+  uint64_t inloop_flush_ns = 0;
+
   std::unordered_map<int, VersionEdit> version_edits;
   // no need to refcount because iteration is under mutex
   for (auto cfd : *versions_->GetColumnFamilySet()) {
@@ -919,7 +1008,8 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
     // to be skipped instead of propagating bad information (like overly
     // large sequence numbers).
     log::Reader reader(immutable_db_options_.info_log, std::move(file_reader),
-                       &reporter, true /*checksum*/, wal_number);
+                       &reporter, true /*checksum*/, wal_number,
+                       /*zrwa_mode=*/::waltz_wal_mode == "zrwa");
 
     // Determine if we should tolerate incomplete records at the tail end of the
     // Read all the records and add to a memtable
@@ -929,10 +1019,19 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
 
     TEST_SYNC_POINT_CALLBACK("DBImpl::RecoverLogFiles:BeforeReadWal",
                              /*arg=*/nullptr);
-    while (!stop_replay_by_wal_filter &&
-           reader.ReadRecord(&record, &scratch,
-                             immutable_db_options_.wal_recovery_mode) &&
-           status.ok()) {
+    auto loop_start = std::chrono::steady_clock::now();
+    uint64_t read_ns_before =
+        g_wal_replay_read_ns.load(std::memory_order_relaxed);
+    uint64_t inloop_flush_ns_before = inloop_flush_ns;
+
+    while (!stop_replay_by_wal_filter && status.ok()) {
+      auto read_start = std::chrono::steady_clock::now();
+      bool read_ok = reader.ReadRecord(
+          &record, &scratch, immutable_db_options_.wal_recovery_mode);
+      g_wal_replay_read_ns.fetch_add(ElapsedNs(read_start),
+                                     std::memory_order_relaxed);
+      if (!read_ok) break;
+
       if (record.size() < WriteBatchInternal::kHeader) {
         reporter.Corruption(record.size(),
                             Status::Corruption("log record too small"));
@@ -1044,11 +1143,19 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
       // we just ignore the update.
       // That's why we set ignore missing column families to true
       bool has_valid_writes = false;
+      // Records come in page order, not sequence order, so keep
+      // next_sequence monotonic across batches
+      SequenceNumber pre_insert_next_seq = *next_sequence;
       status = WriteBatchInternal::InsertInto(
           &batch, column_family_memtables_.get(), &flush_scheduler_,
           &trim_history_scheduler_, true, wal_number, this,
           false /* concurrent_memtable_writes */, next_sequence,
           &has_valid_writes, seq_per_batch_, batch_per_txn_);
+      if (*next_sequence != kMaxSequenceNumber &&
+          pre_insert_next_seq != kMaxSequenceNumber &&
+          *next_sequence < pre_insert_next_seq) {
+        *next_sequence = pre_insert_next_seq;
+      }
       MaybeIgnoreError(&status);
       if (!status.ok()) {
         // We are treating this as a failure while reading since we read valid
@@ -1070,7 +1177,13 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
           auto iter = version_edits.find(cfd->GetID());
           assert(iter != version_edits.end());
           VersionEdit* edit = &iter->second;
+          auto flush_start = std::chrono::steady_clock::now();
           status = WriteLevel0TableForRecovery(job_id, cfd, cfd->mem(), edit);
+          {
+            uint64_t flush_ns = ElapsedNs(flush_start);
+            g_wal_replay_flush_ns.fetch_add(flush_ns, std::memory_order_relaxed);
+            inloop_flush_ns += flush_ns;
+          }
           if (!status.ok()) {
             // Reflect errors immediately so that conditions like full
             // file-systems cause the DB::Open() to fail.
@@ -1082,6 +1195,19 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
                                  *next_sequence);
         }
       }
+    }
+
+    // memtable insert time is what is left of the loop after reads and flushes
+    {
+      uint64_t loop_ns = ElapsedNs(loop_start);
+      uint64_t read_ns = g_wal_replay_read_ns.load(std::memory_order_relaxed) -
+                         read_ns_before;
+      uint64_t flush_ns = inloop_flush_ns - inloop_flush_ns_before;
+      uint64_t insert_ns = 0;
+      if (loop_ns > read_ns + flush_ns) {
+        insert_ns = loop_ns - read_ns - flush_ns;
+      }
+      g_wal_replay_insert_ns.fetch_add(insert_ns, std::memory_order_relaxed);
     }
 
     if (!status.ok()) {
@@ -1209,7 +1335,10 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
         // being full), we flush at the end. Otherwise we'll need to record
         // where we were on last flush, which make the logic complicated.
         if (flushed || !immutable_db_options_.avoid_flush_during_recovery) {
+          auto final_flush_start = std::chrono::steady_clock::now();
           status = WriteLevel0TableForRecovery(job_id, cfd, cfd->mem(), edit);
+          g_wal_replay_flush_ns.fetch_add(ElapsedNs(final_flush_start),
+                                          std::memory_order_relaxed);
           if (!status.ok()) {
             // Recovery failed
             break;

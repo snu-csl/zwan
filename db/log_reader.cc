@@ -25,7 +25,8 @@ Reader::Reporter::~Reporter() {
 
 Reader::Reader(std::shared_ptr<Logger> info_log,
                std::unique_ptr<SequentialFileReader>&& _file,
-               Reporter* reporter, bool checksum, uint64_t log_num)
+               Reporter* reporter, bool checksum, uint64_t log_num,
+               bool zrwa_mode)
     : info_log_(info_log),
       file_(std::move(_file)),
       reporter_(reporter),
@@ -38,7 +39,8 @@ Reader::Reader(std::shared_ptr<Logger> info_log,
       last_record_offset_(0),
       end_of_buffer_offset_(0),
       log_number_(log_num),
-      recycled_(false) {}
+      recycled_(false),
+      zrwa_mode_(zrwa_mode) {}
 
 Reader::~Reader() {
   delete[] backing_store_;
@@ -345,6 +347,9 @@ bool Reader::ReadMore(size_t* drop_size, int *error) {
 }
 
 unsigned int Reader::ReadPhysicalRecord(Slice* result, size_t* drop_size) {
+  if (zrwa_mode_) {
+    return ReadZrwaPhysicalRecord(result, drop_size);
+  }
   while (true) {
     // We need at least the minimum header size
     if (buffer_.size() < static_cast<size_t>(kHeaderSize)) {
@@ -422,6 +427,95 @@ unsigned int Reader::ReadPhysicalRecord(Slice* result, size_t* drop_size) {
     buffer_.remove_prefix(header_size + length);
 
     *result = Slice(header + header_size, length);
+    return type;
+  }
+}
+
+// ZRWA page is [page_crc 4B] followed by [len 2B|type 1B|payload] records
+// and a zero pad. The page CRC covers the records, which never cross a page.
+unsigned int Reader::ReadZrwaPhysicalRecord(Slice* result, size_t* drop_size) {
+  constexpr size_t kZrwaPageSize = 4096;
+  constexpr size_t kZrwaPageHdr = 4;
+  constexpr size_t kZrwaRecHdr = 3;
+
+  while (true) {
+    // A refill can hold several pages, validate and consume one at a time
+    uint64_t cur_off = end_of_buffer_offset_ - buffer_.size();
+    size_t off_in_page = static_cast<size_t>(cur_off % kZrwaPageSize);
+
+    if (off_in_page == 0) {
+      // At a page boundary the page CRC and one header must be present
+      while (buffer_.size() < kZrwaPageHdr + kZrwaRecHdr) {
+        int r = kEof;
+        if (!ReadMore(drop_size, &r)) {
+          *drop_size = buffer_.size();
+          buffer_.clear();
+          return r;
+        }
+      }
+
+      // Validate the page CRC within this page
+      size_t page_bytes = std::min(buffer_.size(), kZrwaPageSize);
+      uint32_t expected = crc32c::Unmask(DecodeFixed32(buffer_.data()));
+      const char* p = buffer_.data() + kZrwaPageHdr;
+      const char* page_end = buffer_.data() + page_bytes;
+      uint32_t actual = 0;
+      while (p + kZrwaRecHdr <= page_end) {
+        uint32_t len = (static_cast<uint32_t>(static_cast<uint8_t>(p[0]))) |
+                       (static_cast<uint32_t>(static_cast<uint8_t>(p[1])) << 8);
+        if (len == 0) break;
+        if (p + kZrwaRecHdr + len > page_end) break;
+        actual = crc32c::Extend(actual, p, kZrwaRecHdr + len);
+        p += kZrwaRecHdr + len;
+      }
+
+      if (checksum_ && actual != expected) {
+        // Page never persisted or corrupt, treat as EOF and drop the tail
+        *drop_size = buffer_.size();
+        buffer_.clear();
+        return kEof;
+      }
+
+      // Consume the page header, buffer_ then points at the first record
+      buffer_.remove_prefix(kZrwaPageHdr);
+      cur_off = end_of_buffer_offset_ - buffer_.size();
+      off_in_page = static_cast<size_t>(cur_off % kZrwaPageSize);
+    }
+
+    // Bytes remaining in this page that can still hold records.
+    size_t bytes_left_in_page = kZrwaPageSize - off_in_page;
+    size_t avail = std::min(buffer_.size(), bytes_left_in_page);
+    if (avail < kZrwaRecHdr) {
+      // No room for another header in this page, move to the next page
+      size_t skip = std::min(bytes_left_in_page, buffer_.size());
+      buffer_.remove_prefix(skip);
+      continue;
+    }
+
+    const char* h = buffer_.data();
+    uint32_t len = (static_cast<uint32_t>(static_cast<uint8_t>(h[0]))) |
+                   (static_cast<uint32_t>(static_cast<uint8_t>(h[1])) << 8);
+    if (len == 0) {
+      // Zero pad, skip the rest of this page
+      size_t skip = std::min(bytes_left_in_page, buffer_.size());
+      buffer_.remove_prefix(skip);
+      continue;
+    }
+    if (kZrwaRecHdr + len > avail) {
+      // Record runs past the page end, treat as a bad record
+      *drop_size = buffer_.size();
+      buffer_.clear();
+      return kBadRecordLen;
+    }
+    unsigned int type = static_cast<uint8_t>(h[2]);
+
+    // Batches carry a single Put, so recovery re-prepends count=1
+    zrwa_record_buf_.resize(4 + len);
+    EncodeFixed32(&zrwa_record_buf_[0], 1u);
+    memcpy(&zrwa_record_buf_[4], h + kZrwaRecHdr, len);
+    *result = Slice(zrwa_record_buf_.data(), zrwa_record_buf_.size());
+
+    buffer_.remove_prefix(kZrwaRecHdr + len);
     return type;
   }
 }

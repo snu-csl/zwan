@@ -127,6 +127,7 @@ LIB_SOURCES =                                                   \
   monitoring/perf_context.cc                                    \
   monitoring/perf_level.cc                                      \
   monitoring/persistent_stats_history.cc                        \
+  monitoring/waf_stats.cc                                       \
   monitoring/statistics.cc                                      \
   monitoring/thread_status_impl.cc                              \
   monitoring/thread_status_updater.cc                           \
@@ -148,6 +149,10 @@ LIB_SOURCES =                                                   \
   port/win/win_logger.cc                                        \
   port/win/win_thread.cc                                        \
   port/stack_trace.cc                                           \
+  plugin/zenfs/fs/fs_zenfs.cc                                   \
+  plugin/zenfs/fs/io_zenfs.cc                                   \
+  plugin/zenfs/fs/wal_zrwa.cc                                   \
+  plugin/zenfs/fs/zbd_zenfs.cc                                  \
   table/adaptive/adaptive_table_factory.cc                      \
   table/block_based/binary_search_index_reader.cc               \
   table/block_based/block.cc                                    \

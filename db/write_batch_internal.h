@@ -76,7 +76,7 @@ struct WriteBatch::ProtectionInfo {
 class WriteBatchInternal {
  public:
 
-  // WriteBatch header has an 8-byte sequence number followed by a 4-byte count.
+  // WriteBatch header has a 4-byte count followed by an 8-byte sequence number.
   static const size_t kHeader = 12;
 
   // WriteBatch methods with column_family_id instead of ColumnFamilyHandle*

@@ -16,15 +16,18 @@ SPDK_LIBRARIES += -lrte_kvargs
 SPDK_LIBRARIES += -lrte_vhost
 SPDK_LIBRARIES += -lrte_power
 
+EXTRA_CXXFLAGS += -g
+
+ROCKSDB_ROOT := $(abspath $(CURDIR)/../../..)
+
 EXTRA_LDFLAGS += -Wl,--whole-archive
 EXTRA_LDFLAGS += -lisal
 EXTRA_LDFLAGS += $(SPDK_LIBRARIES)
 EXTRA_LDFLAGS += -Wl,--no-whole-archive
 
-EXTRA_CXXFLAGS += -g
-
-CXXFLAGS = $(shell pkg-config --cflags rocksdb)
-LIBS = $(shell pkg-config --static --libs rocksdb)
+# prefer the in-tree headers and library over an installed rocksdb
+CXXFLAGS = -I$(ROCKSDB_ROOT)/include $(shell pkg-config --cflags rocksdb)
+LIBS = -L$(ROCKSDB_ROOT) $(shell pkg-config --static --libs rocksdb)
 
 CXXFLAGS +=  $(EXTRA_CXXFLAGS)
 LDFLAGS +=  $(EXTRA_LDFLAGS)

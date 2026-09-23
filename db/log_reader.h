@@ -50,7 +50,7 @@ class Reader {
   // If "checksum" is true, verify checksums if available.
   Reader(std::shared_ptr<Logger> info_log,
          std::unique_ptr<SequentialFileReader>&& file, Reporter* reporter,
-         bool checksum, uint64_t log_num);
+         bool checksum, uint64_t log_num, bool zrwa_mode = false);
   // No copying allowed
   Reader(const Reader&) = delete;
   void operator=(const Reader&) = delete;
@@ -128,6 +128,13 @@ class Reader {
   // Whether this is a recycled log file
   bool recycled_;
 
+  // Whether the log is read as 4 KiB ZRWA pages
+  bool const zrwa_mode_;
+
+  // Scratch for ZRWA records, batches carry a single Put so the stripped
+  // count=1 is re-prepended here
+  std::string zrwa_record_buf_;
+
   // Extend record types with the following special values
   enum {
     kEof = kMaxRecordType + 1,
@@ -148,6 +155,9 @@ class Reader {
 
   // Return type, or one of the preceding special values
   unsigned int ReadPhysicalRecord(Slice* result, size_t* drop_size);
+
+  // Unpacks one record out of a 4 KiB ZRWA page
+  unsigned int ReadZrwaPhysicalRecord(Slice* result, size_t* drop_size);
 
   // Read some more
   bool ReadMore(size_t* drop_size, int *error);

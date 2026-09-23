@@ -30,3 +30,6 @@
 *.exe
 *.out
 *.app
+
+# Machine-local device config
+identify_zns

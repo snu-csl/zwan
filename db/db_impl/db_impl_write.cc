@@ -12,6 +12,7 @@
 #include "db/error_handler.h"
 #include "db/event_helpers.h"
 #include "monitoring/perf_context_imp.h"
+#include "monitoring/waf_stats.h"
 #include "options/options_helper.h"
 #include "test_util/sync_point.h"
 #include "util/cast_util.h"
@@ -253,6 +254,8 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   // Using ZNS append command for WAL write
   IOStatus io_s;
   uint64_t log_size;
+  // Set the sequence before the WAL write so persisted records carry it
+  WriteBatchInternal::SetSequence(my_batch, w.sequence);
   io_s = ZnsAppendToWAL(*my_batch, log_writer, log_used, &log_size);
 
   prt_time(14);
@@ -278,8 +281,6 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
     std::lock_guard<std::mutex> lck(switch_mutex_);
     switch_cv_.notify_all();
   }
-
-  WriteBatchInternal::SetSequence(my_batch, w.sequence);
 
   if (log_used != nullptr) {
     *log_used = w.log_used;
@@ -1228,6 +1229,10 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
   // since alive_log_files_ might be modified concurrently
   alive_log_files_.back().AddSize(log_entry.size());
   log_empty_ = false;
+  const uint32_t batch_count = WriteBatchInternal::Count(&merged_batch);
+  if (io_s.ok() && batch_count > 0) {
+    AddWalRecordCount(batch_count);
+  }
 
   return io_s;
 }
@@ -1252,6 +1257,7 @@ IOStatus DBImpl::ZnsAppendToWAL(const WriteBatch& merged_batch,
   prt_time(13);
 
   if (io_s.ok()) {
+    AddWalRecordCount(WriteBatchInternal::Count(&merged_batch));
     auto stats = default_cf_internal_stats_;
     stats->AddDBStats(InternalStats::kIntStatsWalFileSynced, 1);
     RecordTick(stats_, WAL_FILE_SYNCED);
@@ -1684,8 +1690,9 @@ Status DBImpl::DelayWrite(uint64_t num_bytes,
       TEST_SYNC_POINT("DBImpl::DelayWrite:Sleep");
 
       // Notify write_thread_ about the stall so it can setup a barrier and
-      // fail any pending writers with no_slowdown
-      write_thread_.BeginWriteStall();
+      // fail any pending writers with no_slowdown.
+      // waltz_mode bypasses JoinBatchGroup, the write queue is empty
+      if (!waltz_mode) write_thread_.BeginWriteStall();
       TEST_SYNC_POINT("DBImpl::DelayWrite:BeginWriteStallDone");
       mutex_.Unlock();
       // We will delay the write until we have slept for `delay` microseconds
@@ -1705,7 +1712,7 @@ Status DBImpl::DelayWrite(uint64_t num_bytes,
         immutable_db_options_.clock->SleepForMicroseconds(kDelayInterval);
       }
       mutex_.Lock();
-      write_thread_.EndWriteStall();
+      if (!waltz_mode) write_thread_.EndWriteStall();
     }
 
     // Don't wait if there's a background error, even if its a soft error. We
@@ -1720,10 +1727,10 @@ Status DBImpl::DelayWrite(uint64_t num_bytes,
 
       // Notify write_thread_ about the stall so it can setup a barrier and
       // fail any pending writers with no_slowdown
-      write_thread_.BeginWriteStall();
+      if (!waltz_mode) write_thread_.BeginWriteStall();
       TEST_SYNC_POINT("DBImpl::DelayWrite:Wait");
       bg_cv_.Wait();
-      write_thread_.EndWriteStall();
+      if (!waltz_mode) write_thread_.EndWriteStall();
     }
   }
   assert(!delayed || !write_options.no_slowdown);

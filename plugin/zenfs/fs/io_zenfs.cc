@@ -18,14 +18,18 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <chrono>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "rocksdb/env.h"
 #include "util/coding.h"
+#include "wal_zrwa.h"
 
 extern bool waltz_mode;
+extern bool zenfs_skip_meta_sync;
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -33,6 +37,13 @@ extern Env *g_env;
 extern uint64_t write_logging[32][16];
 extern void prt_time(int pos);
 extern thread_local int logging_idx;
+
+// time spent in ZoneFile::Recover, reported with the WAL replay breakdown
+std::atomic<uint64_t> g_wal_extent_recover_ns{0};
+std::atomic<uint64_t> g_wal_extent_recover_count{0};
+// defined in db/db_impl/db_impl_open.cc
+extern std::atomic<uint64_t> g_wal_read_dev_bytes;
+extern std::atomic<uint64_t> g_wal_read_dev_ios;
 
 ZoneExtent::ZoneExtent(uint64_t start, uint32_t length, Zone* zone)
     : start_(start), length_(length), zone_(zone) {}
@@ -65,6 +76,7 @@ enum ZoneFileTag : uint32_t {
   kWriteLifeTimeHint = 4,
   kExtent = 5,
   kModificationTime = 6,
+  kActiveExtentStart = 7,
 };
 
 void ZoneFile::EncodeTo(std::string* output, uint32_t extent_start) {
@@ -90,8 +102,10 @@ void ZoneFile::EncodeTo(std::string* output, uint32_t extent_start) {
 
   PutFixed32(output, kModificationTime);
   PutFixed64(output, (uint64_t)m_time_);
-  /* We're not encoding active zone and extent start
-   * as files will always be read-only after mount */
+
+  /* Keep the start LBA of the in-flight extent so reopen can recover it */
+  PutFixed32(output, kActiveExtentStart);
+  PutFixed64(output, extent_start_);
 }
 
 void ZoneFile::EncodeJson(std::ostream& json_stream) {
@@ -166,6 +180,12 @@ Status ZoneFile::DecodeFrom(Slice* input) {
           return Status::Corruption("ZoneFile", "Missing creation time");
         m_time_ = (time_t)ct;
         break;
+      case kActiveExtentStart:
+        uint64_t es;
+        if (!GetFixed64(input, &es))
+          return Status::Corruption("ZoneFile", "Active extent start");
+        extent_start_ = es;
+        break;
       default:
         return Status::Corruption("ZoneFile", "Unexpected tag");
     }
@@ -192,6 +212,7 @@ Status ZoneFile::MergeUpdate(std::shared_ptr<ZoneFile> update) {
     extents_.push_back(new ZoneExtent(extent->start_, extent->length_, zone));
   }
 
+  extent_start_ = update->GetExtentStart();
   MetadataSynced();
 
   return Status::OK();
@@ -201,7 +222,7 @@ ZoneFile::ZoneFile(ZonedBlockDevice* zbd, std::string filename,
                    uint64_t file_id)
     : zbd_(zbd),
       active_zone_(NULL),
-      extent_start_(0),
+      extent_start_(NO_EXTENT),
       extent_filepos_(0),
       lifetime_(Env::WLTH_NOT_SET),
       fileSize(0),
@@ -220,6 +241,11 @@ void ZoneFile::SetFileSize(uint64_t sz) { fileSize = sz; }
 void ZoneFile::SetFileModificationTime(time_t mt) { m_time_ = mt; }
 
 ZoneFile::~ZoneFile() {
+  if (simulated_crash_) {
+    // simulate SIGKILL: leave the device state as is
+    // extents_ and active_zone_ are released when the zbd closes
+    return;
+  }
   for (auto e = std::begin(extents_); e != std::end(extents_); ++e) {
     Zone* zone = (*e)->zone_;
 
@@ -234,7 +260,15 @@ ZoneFile::~ZoneFile() {
 }
 
 IOStatus ZoneFile::CloseWR() {
+  if (simulated_crash_) {
+    // simulate SIGKILL: leave the device and the metadata as is
+    // extent_start_ must stay set until the next reopen recovers it
+    return IOStatus::OK();
+  }
   IOStatus s = IOStatus::OK();
+
+  /* No in-flight extent left after a clean close */
+  extent_start_ = NO_EXTENT;
 
   s = CloseActiveZone();
   open_for_wr_ = false;
@@ -245,12 +279,13 @@ IOStatus ZoneFile::CloseWR() {
 IOStatus ZoneFile::CloseActiveZone() {
   IOStatus s = IOStatus::OK();
   if (active_zone_) {
+    Zone* closing_zone = active_zone_;
     s = active_zone_->CloseWR();
     if (!s.ok()) {
       return s;
     }
     ReleaseActiveZone();
-    zbd_->NotifyIOZoneClosed();
+    zbd_->NotifyIOZoneClosed(closing_zone);
   }
   return s;
 }
@@ -311,6 +346,9 @@ IOStatus ZoneFile::PositionedRead(uint64_t offset, size_t n, Slice* result,
   int retry_cnt = 0;
   uint64_t tgt_offset = 0;
 
+  const bool is_wal_read = filename_.size() >= 4 &&
+      filename_.compare(filename_.size() - 4, 4, ".log") == 0;
+
   while(remain_bytes) {
     int cur_retry = 0; // [DU]
     extent = GetExtent(offset, &dev_off);
@@ -332,6 +370,10 @@ IOStatus ZoneFile::PositionedRead(uint64_t offset, size_t n, Slice* result,
     uint64_t read_start = dev_off & zbd_->GetBlockMask();
     uint64_t read_end = (dev_off + chunk_sz + zbd_->GetBlockSize() - 1) & zbd_->GetBlockMask();
     uint64_t read_cnt = read_end - read_start;
+    if (is_wal_read) {
+      g_wal_read_dev_bytes.fetch_add(read_cnt, std::memory_order_relaxed);
+      g_wal_read_dev_ios.fetch_add(1, std::memory_order_relaxed);
+    }
     buffer = (char *)spdk_zmalloc(read_cnt, sysconf(_SC_PAGESIZE), 0, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 
     // [DU] retry code
@@ -438,9 +480,14 @@ IOStatus ZoneFile::Append(void* data, int data_size, int valid_size) {
 
   prt_time(8);
 
+  // in zrwa mode the WAL is written by WalZrwa
+  if (waltz_mode == true && lifetime_ == Env::WLTH_SHORT && g_wal_zrwa != nullptr) {
+    return IOStatus::OK();
+  }
+
   // [JS] for WAL file, use another path
-  if (waltz_mode == true && lifetime_ == Env::WLTH_SHORT) { // this path will only enabled when waltz_mode is enabled
-    // buffer is already allocated from SPDK DMA area, keep using it
+  if (waltz_mode == true && lifetime_ == Env::WLTH_SHORT && g_wal_zrwa == nullptr) {
+    // zone append mode, buffer is already allocated from SPDK DMA area
     s = IOStatus::NoSpace();
     uint64_t alba;
 
@@ -453,12 +500,13 @@ IOStatus ZoneFile::Append(void* data, int data_size, int valid_size) {
           prt_time(10);
           extent_start_ = active_zone_->wp_;
           wal_zone_mutex_.unlock();
+          PersistMetadataIfWal();
         } else {
           continue;
         }
       }
 
-      s = active_zone_->Append((char*)data, data_size, &alba);
+      s = active_zone_->Append((char*)data, data_size, &alba, /*is_wal=*/true);
       prt_time(11);
 
       if (!s.ok() || (active_zone_ && zbd_->CheckNewWalZoneNeeded(active_zone_, alba))) {
@@ -470,6 +518,7 @@ IOStatus ZoneFile::Append(void* data, int data_size, int valid_size) {
           }
           active_zone_ = nullptr;
           wal_zone_mutex_.unlock();
+          PersistMetadataIfWal();
         } else {
           continue;
         }
@@ -531,7 +580,7 @@ IOStatus ZoneFile::Append(void* data, int data_size, int valid_size) {
     wr_size = left;
     if (wr_size > active_zone_->capacity_) wr_size = active_zone_->capacity_;
 
-    s = active_zone_->Write((char*)buffer + offset, wr_size);
+    s = active_zone_->Write((char*)buffer + offset, wr_size, /*is_wal=*/IsWal());
     if (!s.ok()) return s;
 
     fileSize += wr_size;
@@ -571,6 +620,9 @@ void ZoneFile::PrepareWalWrite() {
 }
 
 void ZoneFile::UpdateWalExtent() {
+  // zone append mode only, zrwa tracks its extents on append
+  if (g_wal_zrwa != nullptr) return;
+
   if (!active_zone_)
     return;
 
@@ -578,7 +630,7 @@ void ZoneFile::UpdateWalExtent() {
   IOStatus s = IOStatus::NoSpace();
   uint64_t alba;
 
-  s = active_zone_->Append(buffer, 4096, &alba);
+  s = active_zone_->Append(buffer, 4096, &alba, /*is_wal=*/true);
 
   alba *= 4096;
 
@@ -603,43 +655,124 @@ void ZoneFile::UpdateWalExtent() {
   }
 }
 
-void ZoneFile::Recover() {
-  if (!active_zone_)
-    return; // nothing to do if active_zone is not allocated
+void ZoneFile::PushZrwaExtent(uint64_t end_pos, Zone* zone) {
+  if (end_pos <= extent_start_) return;
+  uint64_t length = end_pos - extent_start_;
+  extents_.push_back(new ZoneExtent(extent_start_, length, zone));
+  zone->used_capacity_ += length;
+  extent_start_ = end_pos;
+  fileSize += length;
+}
 
-  char *buffer = zbd_->GetWalExtentBuffer();
-  IOStatus s = IOStatus::NoSpace();
-  uint64_t alba;
+void ZoneFile::OnWalZrwaAppend(const void* raw) {
+  const ZrwaAppendResult* r = static_cast<const ZrwaAppendResult*>(raw);
+  if (zrwa_first_ || r->zone_generation != zrwa_prev_gen_) {
+    if (!zrwa_first_) PushZrwaExtent(zrwa_prev_end_pos_, zrwa_prev_zone_);
+    extent_start_ = r->start_pos;
+    zrwa_first_ = false;
+    PersistMetadataIfWal();
+  }
+  zrwa_prev_end_pos_ = r->end_pos;
+  zrwa_prev_zone_ = r->zone;
+  zrwa_prev_gen_ = r->zone_generation;
+}
 
-  s = active_zone_->Append(buffer, 4096, &alba);
+void ZoneFile::CloseZrwaExtent() {
+  if (!zrwa_first_ && zrwa_prev_zone_) {
+    PushZrwaExtent(zrwa_prev_end_pos_, zrwa_prev_zone_);
+  }
+}
 
-  alba *= 4096;
-  if (extent_start_ < active_zone_->start_) {
-    // to handling the corruption case of extent_start_ field
-    // in this case, we will treat all the valid part of active_zone_ as the log area
-    // log record will be pared at the RocksDB, and if the header is invalid, it will be simply dropped
-    extent_start_ = active_zone_->start_;
+void ZoneFile::PersistMetadataIfWal() {
+  if (!IsWal() || metadata_writer_ == nullptr) return;
+  metadata_writer_->Persist(shared_from_this());
+}
+
+IOStatus ZoneFile::Recover() {
+  struct RecoverTimer {
+    std::chrono::steady_clock::time_point start;
+    RecoverTimer() : start(std::chrono::steady_clock::now()) {}
+    ~RecoverTimer() {
+      uint64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - start).count();
+      g_wal_extent_recover_ns.fetch_add(ns, std::memory_order_relaxed);
+      g_wal_extent_recover_count.fetch_add(1, std::memory_order_relaxed);
+    }
+  } recover_timer;
+
+  /* extent_start_ is the LBA where the in-flight extent began. active_zone_
+   * is not persisted, so the zone comes from the in-memory zone map. */
+  if (!HasActiveExtent()) return IOStatus::OK();
+
+  Zone* zone = zbd_->GetIOZone(extent_start_);
+  if (zone == nullptr) {
+    return IOStatus::IOError(
+        "Could not find zone for extent start while recovering");
   }
 
-  if (s.ok()) {
-    // in the case of append success, alba is the last valid location for this WAL file
-    uint64_t length = alba - extent_start_;
-    extents_.push_back(new ZoneExtent(extent_start_, length, active_zone_));
-    active_zone_->wp_ = alba + 4096; // 4K more increased for this zone
-    active_zone_->used_capacity_ += length;
-    active_zone_->capacity_ -= (length + 4096);
-
-    fileSize += length;
-  } else {
-    // in the case of append failure, current zone is fully filled
-    uint64_t length = active_zone_->start_ + active_zone_->max_capacity_ - extent_start_;
-    extents_.push_back(new ZoneExtent(extent_start_, length, active_zone_));
-    active_zone_->wp_ = active_zone_->start_ + active_zone_->max_capacity_; // end pointer
-    active_zone_->used_capacity_ += length;
-    active_zone_->capacity_ -= length;
-
-    fileSize += length;
+  if (extent_start_ < zone->start_) {
+    // corruption guard, clamp to the zone start
+    extent_start_ = zone->start_;
   }
+
+  // the write pointer only advances on flush, only WAL files use zrwa
+  if (g_wal_zrwa != nullptr && IsWal()) {
+    // zone->wp_ is the flushed boundary, the zrwa window past it is durable
+    uint64_t hw_wp = zone->wp_;
+    uint64_t zone_end = zone->start_ + zone->max_capacity_;
+    uint64_t zrwa_bytes =
+        static_cast<uint64_t>(g_wal_zrwa->getZrwaSize()) * 4096ULL;
+    uint64_t end_pos = hw_wp + zrwa_bytes;
+    if (end_pos > zone_end) end_pos = zone_end;
+
+    if (end_pos <= extent_start_) {
+      extent_start_ = NO_EXTENT;
+      return IOStatus::OK();
+    }
+
+    uint64_t length = end_pos - extent_start_;
+    extents_.push_back(new ZoneExtent(extent_start_, length, zone));
+    zone->wp_ = end_pos;
+    zone->used_capacity_ += length;
+    if (length <= zone->capacity_) {
+      zone->capacity_ -= length;
+    } else {
+      zone->capacity_ = 0;
+    }
+    extent_start_ = NO_EXTENT;
+
+    fileSize = 0;
+    for (auto* e : extents_) fileSize += e->length_;
+    return IOStatus::OK();
+  }
+
+  /* Non-WAL files take their size from the MANIFEST and the zone may have
+   * been reused, so drop the stale marker instead of absorbing the range. */
+  if (!IsWal()) {
+    extent_start_ = NO_EXTENT;
+    return IOStatus::OK();
+  }
+
+  /* The zone was reset once the WAL became obsolete, nothing to recover */
+  if (zone->wp_ < extent_start_) {
+    extent_start_ = NO_EXTENT;
+    return IOStatus::OK();
+  }
+
+  uint64_t to_recover = zone->wp_ - extent_start_;
+  if (to_recover == 0) {
+    extent_start_ = NO_EXTENT;
+    return IOStatus::OK();
+  }
+
+  zone->used_capacity_ += to_recover;
+  extents_.push_back(new ZoneExtent(extent_start_, to_recover, zone));
+  extent_start_ = NO_EXTENT;
+
+  fileSize = 0;
+  for (auto* e : extents_) fileSize += e->length_;
+
+  return IOStatus::OK();
 }
 
 ZonedWritableFile::ZonedWritableFile(ZonedBlockDevice* zbd, bool _buffered,
@@ -667,10 +800,16 @@ ZonedWritableFile::ZonedWritableFile(ZonedBlockDevice* zbd, bool _buffered,
   }
 
   metadata_writer_ = metadata_writer;
+  zoneFile_->SetMetadataWriter(metadata_writer);
   zoneFile_->OpenWR();
 }
 
 ZonedWritableFile::~ZonedWritableFile() {
+  if (zoneFile_->IsSimulatedCrash()) {
+    // simulate SIGKILL: free the user-space buffer only
+    if (buffered) free(buffer);
+    return;
+  }
   IOStatus s = zoneFile_->CloseWR();
   if (buffered) free(buffer);
 
@@ -679,7 +818,7 @@ ZonedWritableFile::~ZonedWritableFile() {
   }
 }
 
-ZonedWritableFile::MetadataWriter::~MetadataWriter() {}
+MetadataWriter::~MetadataWriter() {}
 
 IOStatus ZonedWritableFile::Truncate(uint64_t size,
                                      const IOOptions& /*options*/,
@@ -690,6 +829,10 @@ IOStatus ZonedWritableFile::Truncate(uint64_t size,
 
 IOStatus ZonedWritableFile::Fsync(const IOOptions& /*options*/,
                                   IODebugContext* /*dbg*/) {
+  if (zoneFile_->IsSimulatedCrash()) {
+    // simulate SIGKILL: skip the flush and the metadata persist
+    return IOStatus::OK();
+  }
   IOStatus s;
 
   if (waltz_mode == false || buffered) {
@@ -702,6 +845,8 @@ IOStatus ZonedWritableFile::Fsync(const IOOptions& /*options*/,
     zoneFile_->PushExtent();
   }
 
+  if (zenfs_skip_meta_sync)
+    return IOStatus::OK();
   return metadata_writer_->Persist(zoneFile_);
 }
 
@@ -725,10 +870,19 @@ IOStatus ZonedWritableFile::RangeSync(uint64_t offset, uint64_t nbytes,
 
 IOStatus ZonedWritableFile::Close(const IOOptions& options,
                                   IODebugContext* dbg) {
+  if (zoneFile_->IsSimulatedCrash()) {
+    // simulate SIGKILL: skip the sync and the close path
+    return IOStatus::OK();
+  }
   Fsync(options, dbg);
   if (waltz_mode == true && !buffered) {
-    // [JS] for WAL file, we need to add current extent
-    zoneFile_->UpdateWalExtent();
+    if (g_wal_zrwa != nullptr) {
+      // finalize the extent tracked on append
+      zoneFile_->CloseZrwaExtent();
+    } else {
+      // zone append mode
+      zoneFile_->UpdateWalExtent();
+    }
   }
   return zoneFile_->CloseWR();
 }

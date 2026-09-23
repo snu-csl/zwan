@@ -37,8 +37,10 @@ DEFINE_int32(finish_threshold, 0, "Finish used zones if less than x% left");
 DEFINE_string(restore_path, "", "Path to restore files");
 DEFINE_string(backup_path, "", "Path to backup files");
 DEFINE_string(zns_pci, "", "PCIe BDF address of ZNS SSD");
+DEFINE_string(waltz_wal_mode, "append", "WAL mode: append or zrwa");
 
 extern std::string zns_pcie_addr;
+extern std::string waltz_wal_mode;
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -665,6 +667,7 @@ int main(int argc, char **argv) {
   }
 
   zns_pcie_addr = FLAGS_zns_pci;
+  waltz_wal_mode = FLAGS_waltz_wal_mode;
 
   if (FLAGS_zbd.empty() && subcmd != "ls-uuid") {
     fprintf(stderr, "You need to specify a zoned block device using --zbd\n");

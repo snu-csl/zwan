@@ -999,6 +999,9 @@ class FSWritableFile {
     return IOStatus::OK();
   }
 
+  // ZRWA WAL extent tracking callback
+  virtual void OnWalZrwaAppend(const void* /*result*/) {}
+
   // If you're adding methods here, remember to add them to
   // WritableFileWrapper too.
 

@@ -41,6 +41,7 @@
 #include "db/version_set.h"
 #include "hdfs/env_hdfs.h"
 #include "monitoring/histogram.h"
+#include "monitoring/waf_stats.h"
 #include "monitoring/statistics.h"
 #include "options/cf_options.h"
 #include "port/port.h"
@@ -49,6 +50,7 @@
 #include "rocksdb/convenience.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
+#include "rocksdb/file_system.h"
 #include "rocksdb/filter_policy.h"
 #include "rocksdb/memtablerep.h"
 #include "rocksdb/options.h"
@@ -92,13 +94,29 @@
 #include "memory/memkind_kmem_allocator.h"
 #endif
 
+#if !defined(ROCKSDB_LITE) && defined(OS_LINUX)
+#include "plugin/zenfs/fs/fs_zenfs.h"
+#include "plugin/zenfs/fs/wal_zrwa.h"
+#endif
+
 #ifdef OS_WIN
 #include <io.h>  // open/close
 #endif
 
 extern bool logging_enable;
 extern bool waltz_mode;
+extern bool zrwa_exp_flush;
+extern bool zenfs_skip_meta_sync;
 extern std::string zns_pcie_addr;
+extern std::string waltz_wal_mode;
+extern uint32_t waltz_prio_window;
+
+#if !defined(ROCKSDB_LITE) && defined(OS_LINUX)
+extern "C" ROCKSDB_NAMESPACE::FactoryFunc<ROCKSDB_NAMESPACE::FileSystem>
+    zenfs_filesystem_reg;
+static const auto* volatile kZenfsFilesystemRegAnchor =
+    &zenfs_filesystem_reg;
+#endif
 
 using GFLAGS_NAMESPACE::ParseCommandLineFlags;
 using GFLAGS_NAMESPACE::RegisterFlagValidator;
@@ -231,6 +249,9 @@ IF_ROCKSDB_LITE("",
     "\tflush - flush the memtable\n"
     "\tstats       -- Print DB stats\n"
     "\tresetstats  -- Reset DB stats\n"
+    "\tresetwafstats  -- Reset shared WAF stats\n"
+    "\tprintwafstats_prefill  -- Print shared WAF stats for prefill\n"
+    "\tprintwafstats_workload -- Print shared WAF stats for workload\n"
     "\tlevelstats  -- Print the number of files and bytes per level\n"
     "\tmemstats  -- Print memtable stats\n"
     "\tsstables    -- Print sstable info\n"
@@ -251,6 +272,11 @@ DEFINE_double(waltz_zipf_dist, 0.99, "WALTZ zipf distribution, default 0.99");
 DEFINE_uint64(waltz_key_range, 1000000, "WALTZ key range");
 DEFINE_uint64(waltz_scan_max, 100, "WALTZ max scan length, default 100");
 DEFINE_string(waltz_pcie_addr, "", "WALTZ pcie address of ZNS SSD");
+DEFINE_string(waltz_wal_mode, "append", "WAL mode: append or zrwa");
+DEFINE_bool(zenfs_skip_meta_sync, false, "Skip metazone persist on Fsync");
+DEFINE_bool(zrwa_exp_flush, true, "ZRWA explicit flush (false=implicit flush only)");
+DEFINE_uint32(waltz_prio_window, 4,
+              "ZRWA priority ring window size in pages (0=disabled, default 4)");
 
 DEFINE_int64(num, 1000000, "Number of key/values to place in database");
 
@@ -1286,19 +1312,19 @@ DEFINE_double(key_dist_b, 0.0,
 DEFINE_double(value_theta, 0.0,
               "The parameter 'theta' of Generized Pareto Distribution "
               "f(x)=(1/sigma)*(1+k*(x-theta)/sigma)^-(1/k+1)");
-DEFINE_double(value_k, 0.0,
+DEFINE_double(value_k, 0.2615,
               "The parameter 'k' of Generized Pareto Distribution "
               "f(x)=(1/sigma)*(1+k*(x-theta)/sigma)^-(1/k+1)");
-DEFINE_double(value_sigma, 0.0,
+DEFINE_double(value_sigma, 25.45,
               "The parameter 'theta' of Generized Pareto Distribution "
               "f(x)=(1/sigma)*(1+k*(x-theta)/sigma)^-(1/k+1)");
 DEFINE_double(iter_theta, 0.0,
               "The parameter 'theta' of Generized Pareto Distribution "
               "f(x)=(1/sigma)*(1+k*(x-theta)/sigma)^-(1/k+1)");
-DEFINE_double(iter_k, 0.0,
+DEFINE_double(iter_k, 2.517,
               "The parameter 'k' of Generized Pareto Distribution "
               "f(x)=(1/sigma)*(1+k*(x-theta)/sigma)^-(1/k+1)");
-DEFINE_double(iter_sigma, 0.0,
+DEFINE_double(iter_sigma, 14.236,
               "The parameter 'sigma' of Generized Pareto Distribution "
               "f(x)=(1/sigma)*(1+k*(x-theta)/sigma)^-(1/k+1)");
 DEFINE_double(mix_get_ratio, 1.0,
@@ -3257,6 +3283,7 @@ class Benchmark {
         }
       }
       if (req_type == kWrite || req_type == kUpdate) {
+        AddUserDataBytes(key.size() + value_size);
         auto status = db->Put(write_options_, key, gen.Generate(value_size));
         if (!status.ok()) {
           fprintf(stderr, "Put returned an error: %s\n", status.ToString().c_str());
@@ -3670,6 +3697,12 @@ class Benchmark {
         PrintStats("rocksdb.stats");
       } else if (name == "resetstats") {
         ResetStats();
+      } else if (name == "resetwafstats") {
+        ResetSharedWafStats();
+      } else if (name == "printwafstats_prefill") {
+        EmitWafStats("prefill");
+      } else if (name == "printwafstats_workload") {
+        EmitWafStats("workload");
       } else if (name == "verify") {
         VerifyDBFromDB(FLAGS_truth_db);
       } else if (name == "levelstats") {
@@ -3714,6 +3747,76 @@ class Benchmark {
       // [JS] WALTZ benchmark
       } else if (name == "microbench") {
         method = &Benchmark::WaltzMicroBench;
+#if !defined(ROCKSDB_LITE) && defined(OS_LINUX)
+      } else if (name == "simulate_crash_and_reopen") {
+        // in-process recovery test, mimics SIGKILL without touching the device
+        fprintf(stderr, "simulating crash, wal_mode=%s\n",
+                FLAGS_waltz_wal_mode.c_str());
+
+        // rtti is disabled, check the fs name instead of dynamic_cast
+        auto fs = FLAGS_env->GetFileSystem();
+        if (fs == nullptr ||
+            std::string(fs->Name()).find("ZenFS") == std::string::npos) {
+          fprintf(stderr,
+                  "filesystem is not ZenFS (name=%s env_uri=%s fs_uri=%s)\n",
+                  fs ? fs->Name() : "(null)", FLAGS_env_uri.c_str(),
+                  FLAGS_fs_uri.c_str());
+          ErrorExit();
+        }
+        auto* zfs = static_cast<ZenFS*>(fs.get());
+
+        if (db_.db != nullptr) {
+          // mark WAL zone files before close so Fsync and CloseWR early-return
+          zfs->MarkWalSimulatedCrash();
+
+          Status sds = db_.db->SetDBOptions(
+              {{"avoid_flush_during_shutdown", "true"}});
+          if (!sds.ok()) {
+            fprintf(stderr, "SetDBOptions warning: %s\n",
+                    sds.ToString().c_str());
+          }
+
+          // graceful close releases the lock and drops the cf handles
+          Status cs = db_.db->Close();
+          if (!cs.ok()) {
+            fprintf(stderr, "DB::Close warning: %s\n",
+                    cs.ToString().c_str());
+          }
+          delete db_.db;
+          db_.db = nullptr;
+        }
+        for (auto& m : multi_dbs_) {
+          if (m.db) {
+            delete m.db;
+            m.db = nullptr;
+          }
+        }
+
+        // tear down WalZrwa with no retire io, drop the WAL zone file entries
+        zfs->SimulateCrash();
+
+        // the zbd dtor releases the non-WAL zone files
+        fs.reset();
+        env_guard.reset();
+        FLAGS_env = Env::Default();
+
+        sleep(1);
+
+        // re-create env, reusing the attached controller and qpairs
+        ConfigOptions config_options;
+        Status reopen_s = Env::CreateFromUri(config_options, FLAGS_env_uri,
+                                             FLAGS_fs_uri, &FLAGS_env,
+                                             &env_guard);
+        if (!reopen_s.ok()) {
+          fprintf(stderr, "CreateFromUri failed: %s\n",
+                  reopen_s.ToString().c_str());
+          ErrorExit();
+        }
+
+        // Open already calls OpenDb, a second call would hit the file lock
+        Open(&open_options_);
+        fprintf(stderr, "crash simulation done, db reopened\n");
+#endif
       } else if (!name.empty()) {  // No error message for empty name
         fprintf(stderr, "unknown benchmark '%s'\n", name.c_str());
         ErrorExit();
@@ -4583,6 +4686,13 @@ class Benchmark {
     options.statistics = dbstats;
     options.wal_dir = FLAGS_wal_dir;
     options.create_if_missing = !FLAGS_use_existing_db;
+    // skip the holes left by in-flight writes at crash time, the reader
+    // resyncs past each one
+    if (FLAGS_waltz_wal_mode == "zrwa" || FLAGS_waltz_wal_mode == "append") {
+      options.wal_recovery_mode = WALRecoveryMode::kSkipAnyCorruptedRecords;
+      // one WAL record per 4 KiB page, match the log block to that
+      ROCKSDB_NAMESPACE::log::SetBlockSize(4096);
+    }
     options.dump_malloc_stats = FLAGS_dump_malloc_stats;
     options.stats_dump_period_sec =
         static_cast<unsigned int>(FLAGS_stats_dump_period_sec);
@@ -5232,6 +5342,7 @@ class Benchmark {
         }
         batch_bytes += val.size() + key_size_ + user_timestamp_size_;
         bytes += val.size() + key_size_ + user_timestamp_size_;
+        AddUserDataBytes(key_size_ + val.size());
         ++num_written;
 
         // If all disposable entries have been inserted, then we need to
@@ -6484,6 +6595,7 @@ class Benchmark {
         } else if (val_size > value_max) {
           val_size = val_size % value_max;
         }
+        AddUserDataBytes(key.size() + val_size);
         s = db_with_cfh->db->Put(
             write_options_, key,
             gen.Generate(static_cast<unsigned int>(val_size)));
@@ -8122,6 +8234,24 @@ class Benchmark {
     }
   }
 
+  void ResetSharedWafStats() {
+    ROCKSDB_NAMESPACE::ResetWafStats();
+#if !defined(ROCKSDB_LITE) && defined(OS_LINUX)
+    if (ROCKSDB_NAMESPACE::g_wal_zrwa != nullptr) {
+      ROCKSDB_NAMESPACE::g_wal_zrwa->resetStats();
+    }
+#endif
+  }
+
+  void EmitWafStats(const char* phase) {
+    ROCKSDB_NAMESPACE::PrintWafStats(phase);
+#if !defined(ROCKSDB_LITE) && defined(OS_LINUX)
+    if (ROCKSDB_NAMESPACE::g_wal_zrwa != nullptr) {
+      ROCKSDB_NAMESPACE::g_wal_zrwa->printStats(phase);
+    }
+#endif
+  }
+
   void PrintStatsHistory() {
     if (db_.db != nullptr) {
       PrintStatsHistoryImpl(db_.db, false);
@@ -8319,6 +8449,10 @@ int db_bench_tool(int argc, char** argv) {
   if (env_opts == 1) {
     // first, set the PCIe address of ZNS SSD, before calling NewZenFS
     zns_pcie_addr = FLAGS_waltz_pcie_addr;
+    waltz_wal_mode = FLAGS_waltz_wal_mode;
+    waltz_prio_window = FLAGS_waltz_prio_window;
+    zenfs_skip_meta_sync = FLAGS_zenfs_skip_meta_sync;
+    zrwa_exp_flush = FLAGS_zrwa_exp_flush;
     Status s = Env::CreateFromUri(config_options, FLAGS_env_uri, FLAGS_fs_uri,
                                   &FLAGS_env, &env_guard);
     if (!s.ok()) {

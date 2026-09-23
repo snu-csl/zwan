@@ -40,8 +40,18 @@ class ZoneExtent {
   void EncodeJson(std::ostream& json_stream);
 };
 
-class ZoneFile {
+class ZoneFile;
+
+class MetadataWriter {
+ public:
+  virtual ~MetadataWriter();
+  virtual IOStatus Persist(std::shared_ptr<ZoneFile> zoneFile) = 0;
+};
+
+class ZoneFile : public std::enable_shared_from_this<ZoneFile> {
  protected:
+  static constexpr uint64_t NO_EXTENT = 0xffffffffffffffffULL;
+
   ZonedBlockDevice* zbd_;
   std::vector<ZoneExtent*> extents_;
   Zone* active_zone_;
@@ -55,10 +65,13 @@ class ZoneFile {
 
   uint32_t nr_synced_extents_;
   bool open_for_wr_ = false;
+  bool simulated_crash_{false};
   time_t m_time_;
 
   std::atomic<uint64_t> appended_;
   std::mutex wal_zone_mutex_;
+
+  MetadataWriter* metadata_writer_{nullptr};
 
  public:
   explicit ZoneFile(ZonedBlockDevice* zbd, std::string filename,
@@ -84,6 +97,15 @@ class ZoneFile {
   std::vector<ZoneExtent*> GetExtents() { return extents_; }
   Env::WriteLifeTimeHint GetWriteLifeTimeHint() { return lifetime_; }
 
+  // WAL files are the ones named ".log"
+  bool IsWal() const {
+    return filename_.size() >= 4 &&
+           filename_.compare(filename_.size() - 4, 4, ".log") == 0;
+  }
+
+  void MarkSimulatedCrash() { simulated_crash_ = true; }
+  bool IsSimulatedCrash() const { return simulated_crash_; }
+
   IOStatus PositionedRead(uint64_t offset, size_t n, Slice* result,
                           char* scratch, bool direct);
   ZoneExtent* GetExtent(uint64_t file_offset, uint64_t* dev_offset);
@@ -103,11 +125,26 @@ class ZoneFile {
   uint64_t GetID() { return file_id_; }
   size_t GetUniqueId(char* id, size_t max_size);
 
+  uint64_t GetExtentStart() const { return extent_start_; }
+  bool HasActiveExtent() const { return extent_start_ != NO_EXTENT; }
+
   void PrepareWalWrite();
   void UpdateWalExtent();
-  void Recover();
+  IOStatus Recover();
+
+  void SetMetadataWriter(MetadataWriter* w) { metadata_writer_ = w; }
+  void PersistMetadataIfWal();
+
+  void PushZrwaExtent(uint64_t end_pos, Zone* zone);
+  void OnWalZrwaAppend(const void* result);
+  void CloseZrwaExtent();
 
  private:
+  bool zrwa_first_{true};
+  uint64_t zrwa_prev_end_pos_{0};
+  Zone* zrwa_prev_zone_{nullptr};
+  uint32_t zrwa_prev_gen_{0};
+
   void ReleaseActiveZone();
   void SetActiveZone(Zone* zone);
   IOStatus CloseActiveZone();
@@ -117,11 +154,7 @@ class ZoneFile {
 class ZonedWritableFile : public FSWritableFile {
  public:
   /* Interface for persisting metadata for files */
-  class MetadataWriter {
-   public:
-    virtual ~MetadataWriter();
-    virtual IOStatus Persist(std::shared_ptr<ZoneFile> zoneFile) = 0;
-  };
+  using MetadataWriter = ROCKSDB_NAMESPACE::MetadataWriter;
 
   explicit ZonedWritableFile(ZonedBlockDevice* zbd, bool buffered,
                              std::shared_ptr<ZoneFile> zoneFile,
@@ -164,6 +197,9 @@ class ZonedWritableFile : public FSWritableFile {
   void SetWriteLifeTimeHint(Env::WriteLifeTimeHint hint) override;
   virtual Env::WriteLifeTimeHint GetWriteLifeTimeHint() override {
     return zoneFile_->GetWriteLifeTimeHint();
+  }
+  void OnWalZrwaAppend(const void* result) override {
+    zoneFile_->OnWalZrwaAppend(result);
   }
 
  private:

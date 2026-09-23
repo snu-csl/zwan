@@ -107,6 +107,8 @@
 
 bool logging_enable = false;
 bool waltz_mode = false;
+bool zrwa_exp_flush = true;
+bool zenfs_skip_meta_sync = false;
 std::string zns_pcie_addr;
 
 namespace ROCKSDB_NAMESPACE {

@@ -38,6 +38,8 @@ class Superblock {
   char reserved_[123] = {0};
 
  public:
+  static constexpr uint32_t FLAG_ZRWA_WAL = (1u << 0);
+
   const uint32_t MAGIC = 0x5a454e46; /* ZENF */
   const uint32_t ENCODED_SIZE = 512;
   const uint32_t CURRENT_SUPERBLOCK_VERSION = 1;
@@ -79,6 +81,8 @@ class Superblock {
   std::string GetAuxFsPath() { return std::string(aux_fs_path_); }
   uint32_t GetFinishTreshold() { return finish_treshold_; }
   std::string GetUUID() { return std::string(uuid_); }
+  bool HasZrwaFlag() const { return (flags_ & FLAG_ZRWA_WAL) != 0; }
+  void SetZrwaFlag() { flags_ |= FLAG_ZRWA_WAL; }
 };
 
 class ZenMetaLog {
@@ -156,6 +160,7 @@ class ZenFS : public FileSystemWrapper {
   IOStatus PersistSnapshot(ZenMetaLog* meta_writer);
   IOStatus PersistRecord(std::string record);
   IOStatus SyncFileMetadata(std::shared_ptr<ZoneFile> zoneFile);
+  IOStatus Repair();
 
   void EncodeSnapshotTo(std::string* output);
   void EncodeFileDeletionTo(std::shared_ptr<ZoneFile> zoneFile,
@@ -188,6 +193,13 @@ class ZenFS : public FileSystemWrapper {
 
   Status Mount(bool readonly);
   Status MkFS(std::string aux_fs_path, uint32_t finish_threshold);
+
+  // Simulate SIGKILL, skip the WAL close path and release the ZRWA I/O
+  // thread without retire I/O
+  void SimulateCrash();
+
+  // Mark the known WAL files so later close and sync calls skip the device
+  void MarkWalSimulatedCrash();
   std::map<std::string, Env::WriteLifeTimeHint> GetWriteLifeTimeHints();
 
   const char* Name() const override {
